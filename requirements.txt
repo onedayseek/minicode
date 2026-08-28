@@ -1,0 +1,4 @@
+# 仅作 HTTP 客户端使用，不使用其任何 agent / assistant 能力
+openai>=1.40
+# 终端渲染
+rich>=13.0
