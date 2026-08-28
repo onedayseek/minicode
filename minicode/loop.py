@@ -8,6 +8,7 @@ from .context import Context
 from .errors import FatalError, RetryableError, ToolError, UserAbort
 from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
+from .session import SessionLog
 from .tools import build_registry
 from .tools.shell import EXIT_PREFIX
 
@@ -23,16 +24,18 @@ class Stop:
 
 
 class Agent:
-    def __init__(self, llm: LLMClient, root: Path, system_prompt: str, ui) -> None:
+    def __init__(self, llm: LLMClient, root: Path, system_prompt: str, ui, log: SessionLog) -> None:
         self.llm = llm
         self.root = root
         self.ui = ui
+        self.log = log
         self.context = Context(system_prompt)
         self.seen_files: set[str] = set()
         self.tools = build_registry(root, self.seen_files)
         self._nudged = False
 
     def run(self, user_input: str) -> None:
+        self.log.user(user_input)
         self.context.add_user(user_input)
         started = time.monotonic()
         step = 0
@@ -42,6 +45,7 @@ class Agent:
             step += 1
             stop = self._check_stop(step, started)
             if stop:
+                self.log.stop(stop.reason)
                 self.ui.notice(stop.reason)
                 return
 
@@ -49,23 +53,29 @@ class Agent:
             if note:
                 self.ui.notice(note)
 
+            self.log.request(step, self.context.render(), [t["function"]["name"] for t in self.tools.schemas()])
             try:
                 reply = self.llm.chat(
                     self.context.render(), self.tools.schemas(), on_text=self.ui.stream
                 )
             except RetryableError as e:
+                self.log.stop(f"网络重试已用尽：{e}")
                 self.ui.notice(f"网络重试已用尽：{e}")
                 return
             except FatalError as e:
+                self.log.stop(f"致命错误：{e}")
                 self.ui.error(str(e))
                 return
 
             self.ui.end_stream()
             self.context.prompt_tokens = self.llm.last_usage.prompt_tokens
+            self.log.reply(step, reply.text, reply.tool_calls, self.llm.last_usage)
             self.context.add_assistant(reply.text, reply.tool_calls)
+            self.ui.set_status(step, self.context.usage_ratio(), self.context.prompt_tokens)
 
             # 模型不再请求动作，说明它认为这一轮做完了，把控制权还给用户
             if not reply.tool_calls:
+                self.log.stop("自然终止")
                 return
 
             for call in reply.tool_calls:
@@ -74,6 +84,7 @@ class Agent:
                 failures[key] = 0 if ok else failures.get(key, 0) + 1
                 if failures[key] >= STUCK_THRESHOLD:
                     if self._nudged:
+                        self.log.stop(f"{key} 连续失败")
                         self.ui.notice(f"{key} 连续失败，已停止。请调整任务描述后重试。")
                         return
                     self._nudged = True
@@ -110,27 +121,21 @@ class Agent:
             result = tool.run(**args)
 
         except UserAbort as e:
-            self.context.add_tool_result(call, f"[已取消] {e}")
-            self.ui.tool_end("fail", str(e))
-            return False
+            return self._record(call, "fail", f"[已取消] {e}")
         except ToolError as e:
-            self.context.add_tool_result(call, f"错误：{e}")
-            self.ui.tool_end("fail", str(e))
-            return False
+            return self._record(call, "fail", f"错误：{e}")
         except TypeError as e:
             # 参数名对不上工具签名
-            self.context.add_tool_result(call, f"错误：参数不匹配（{e}）")
-            self.ui.tool_end("fail", str(e))
-            return False
+            return self._record(call, "fail", f"错误：参数不匹配（{e}）")
         except Exception as e:  # 兜底：任何工具内部异常都不应让 agent 整个退出
-            self.context.add_tool_result(
-                call, f"错误：{type(e).__name__}: {e}"
-            )
-            self.ui.tool_end("fail", f"{type(e).__name__}: {e}")
-            return False
+            return self._record(call, "fail", f"错误：{type(e).__name__}: {e}")
 
-        self.context.add_tool_result(call, result)
         # 命令退出码非零不算工具失败：模型需要读那段输出才能修问题，
         # 也不该让连续的测试失败触发卡死检测。
-        self.ui.tool_end("warn" if result.startswith(EXIT_PREFIX) else "ok", result)
-        return True
+        return self._record(call, "warn" if result.startswith(EXIT_PREFIX) else "ok", result)
+
+    def _record(self, call: ToolCall, status: str, content: str) -> bool:
+        self.context.add_tool_result(call, content)
+        self.log.tool_result(call, status, content)
+        self.ui.tool_end(status, content)
+        return status != "fail"

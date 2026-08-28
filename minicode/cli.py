@@ -7,12 +7,14 @@ from pathlib import Path
 from .errors import FatalError
 from .llm import LLMClient, load_dotenv
 from .loop import Agent
+from .session import SessionLog
 from .ui import UI
 
 HELP = """\
 /help     显示本帮助
 /clear    清空对话历史，开始新会话
 /status   查看上下文占用
+/log      显示本次会话记录文件的位置
 /exit     退出
 """
 
@@ -46,16 +48,17 @@ def main(argv: list[str] | None = None) -> int:
         ui.error(str(e))
         return 2
 
-    agent = Agent(llm, root, load_system_prompt(root), ui)
+    log = SessionLog(root, llm.model)
+    agent = Agent(llm, root, load_system_prompt(root), ui, log)
 
     if args.prompt:
         agent.run(args.prompt)
         return 0
 
-    ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认")
+    ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认", log.path)
     while True:
         try:
-            line = ui.console.input("[bold green]›[/] ").strip()
+            line = ui.prompt().strip()
         except (EOFError, KeyboardInterrupt):
             ui.console.print()
             return 0
@@ -70,9 +73,13 @@ def main(argv: list[str] | None = None) -> int:
             elif line == "/clear":
                 agent.context.reset()
                 agent.seen_files.clear()
+                ui.status_line = ""
+                log.event("clear")
                 ui.notice("已清空对话历史")
             elif line == "/status":
-                ui.status(agent.context.usage_ratio(), agent.context.prompt_tokens)
+                ui.show_status()
+            elif line == "/log":
+                ui.notice(str(log.path))
             else:
                 ui.notice(f"未知命令 {line}，试试 /help")
             continue
@@ -81,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
             agent.run(line)
         except KeyboardInterrupt:
             ui.end_stream()
+            log.stop("用户中断")
             ui.notice("已中断。对话历史保留，可以直接继续。")
 
 
