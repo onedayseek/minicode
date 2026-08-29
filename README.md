@@ -18,9 +18,20 @@ python -m minicode
 python -m minicode                          # 交互式
 python -m minicode -C ./some-project        # 指定工作目录
 python -m minicode -p "给 utils.py 补测试并跑通"   # 单次任务
+python -m minicode --resume                 # 恢复最近一次会话
+python -m minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
 ```
 
-交互模式下可用 `/help` `/clear` `/status` `/exit`。
+每次运行的会话记录写在 `工作目录/.minicode/sessions/*.jsonl`（一行一个事件，模型实际看到和产生的内容）。`--resume` 从这份记录重建对话上下文继续工作，Ctrl-C 中断或换电脑都能接着上次的进度；恢复后写新会话文件，不覆盖原记录。
+
+交互模式下可用 `/help` `/clear` `/status` `/log` `/exit`。
+
+## 测试
+
+```bash
+pip install pytest
+pytest tests/
+```
 
 ## 结构
 
