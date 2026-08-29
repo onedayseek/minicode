@@ -57,15 +57,30 @@ class LLMClient:
             api_key=os.environ.get("MINICODE_API_KEY", ""),
         )
 
-    def chat(self, messages: list[dict], tools: list[dict], on_text=None) -> Reply:
-        """一次带重试的流式对话。on_text 用于边收边打印。"""
+    def chat(self, messages: list[dict], tools: list[dict], on_text=None, on_retry=None) -> Reply:
+        """一次带重试的流式对话。
+
+        on_text 边收边打印。on_retry(原因, 本次是否已经吐出过文本) 在每次重试前调用：
+        流式已经打到终端上的内容擦不掉，重试会把同一段重新生成一遍，
+        不说明的话用户只会看到屏幕上莫名其妙出现了两份半截回答。
+        """
         delays = [1.0, 2.0, 4.0]
         for attempt in range(len(delays) + 1):
+            streamed = False
+
+            def tap(chunk: str) -> None:
+                nonlocal streamed
+                streamed = True
+                if on_text:
+                    on_text(chunk)
+
             try:
-                return self._chat_once(messages, tools, on_text)
-            except RetryableError:
+                return self._chat_once(messages, tools, tap)
+            except RetryableError as e:
                 if attempt == len(delays):
                     raise
+                if on_retry:
+                    on_retry(str(e), streamed)
                 time.sleep(delays[attempt])
         raise RetryableError("重试已用尽")  # 不会走到，兜底
 

@@ -12,17 +12,22 @@ from .base import Tool, resolve
 from .textfile import TextMeta, normalize, read_source, write_source
 
 MAX_READ_LINES = 2000
-MAX_READ_BYTES = 400_000
+# 整读上限。这只是内存保护 —— 返回给模型的内容由 limit 行数控制，跟这个值无关。
+# 早先设成 400KB，把一整类正常文件（打包产物、CSV、日志）挡在外面，
+# 而报错还让模型用 offset / limit 重试，那条路径同样要整读，于是必然再失败一次。
+MAX_READ_BYTES = 5_000_000
 
 
 def make_tools(root: Path, seen: set) -> list[Tool]:
     """seen 由 loop 共享，用于 read-before-edit 约束。"""
 
     def _load(target: Path) -> tuple[str, TextMeta]:
-        if target.stat().st_size > MAX_READ_BYTES:
+        size = target.stat().st_size
+        if size > MAX_READ_BYTES:
+            # 不提 offset / limit：它们要先整读再切片，走不通。只给真正做得到的两条路。
             raise ToolError(
-                f"{target.name} 有 {target.stat().st_size} 字节，超出单次读取上限。"
-                f"请用 offset / limit 分段读，或先用 grep 定位。"
+                f"{target.name} 有 {size} 字节，超过 {MAX_READ_BYTES} 字节的整读上限。"
+                f"请改用 grep 在文件里定位，或用 shell 按它描述里的解释器语法分段取。"
             )
         return read_source(target)
 

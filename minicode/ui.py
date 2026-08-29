@@ -53,6 +53,17 @@ class UI:
             self.console.print()
             self._streaming = False
 
+    def retry_notice(self, reason: str, partial: bool) -> None:
+        """请求失败、正在退避重试。
+
+        已经流到终端上的文本擦不掉，只能说明它会被重新生成一遍 ——
+        否则用户看到的是屏幕上凭空多出半截重复的回答，且不知道为什么要等。
+        """
+        self.end_stream()
+        detail = reason.splitlines()[0][:120] if reason.strip() else "未知原因"
+        tail = "，上面这段会重新生成" if partial else ""
+        self.console.print(f"[dim]— 请求中断（{escape(detail)}），正在重试{tail}[/]")
+
     # ---- 工具调用 ----
 
     def tool_start(self, name: str, args: dict) -> None:

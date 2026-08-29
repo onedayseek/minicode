@@ -3,26 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import assert_groups_valid
 from minicode.session import load_session
-
-
-def assert_groups_valid(messages: list[dict]) -> None:
-    """校验消息数组满足 API 的成组约束。
-
-    role=tool 的消息必须紧跟在带 tool_calls 的 assistant 之后，且 id 对得上。
-    不满足时 API 返回 400: "Messages with role 'tool' must be a response to
-    a preceding message with 'tool_calls'"。
-    """
-    open_ids: set[str] = set()
-    for i, msg in enumerate(messages):
-        if msg["role"] == "assistant":
-            open_ids = {c["id"] for c in msg.get("tool_calls", [])}
-        elif msg["role"] == "tool":
-            assert msg["tool_call_id"] in open_ids, (
-                f"第 {i} 条是孤儿 tool 消息（tool_call_id={msg['tool_call_id']}）"
-            )
-        else:
-            open_ids = set()
 
 
 def write_log(tmp_path: Path, events: list[dict]) -> Path:

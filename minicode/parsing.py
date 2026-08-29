@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from .errors import ToolError
 
 _TRAILING_COMMA = re.compile(r",\s*([}\]])")
+# 完整围栏和只剩开头的围栏（输出被截断时）分开处理
+_FENCE_FULL = re.compile(r"^```[a-zA-Z]*\s*(.*?)\s*```$", re.DOTALL)
+_FENCE_OPEN = re.compile(r"^```[a-zA-Z]*\s*")
 
 
 @dataclass
@@ -71,22 +74,48 @@ class ToolCallAccumulator:
         return calls
 
 
+def _close_brackets(s: str) -> str:
+    """按嵌套顺序补上未闭合的括号，模型输出被截断时常见。
+
+    不能只数 `{` 和 `[` 的差额再各补各的：
+    - 顺序会错。`{"tags": ["x"` 先补 `}` 再补 `]` 得到 `["x"}]`，照样不合法。
+    - 字符串字面量里的括号不算数。`{"content": "def f() {` 会被多算一个。
+
+    所以扫一遍维护栈，顺带把截断在半路的字符串也收尾。
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack and stack[-1] == ch:
+            stack.pop()
+    if in_string:
+        s += '"'
+    return s + "".join(reversed(stack))
+
+
 def _repair_json(raw: str) -> str:
     """对模型常见的 JSON 小毛病做轻量修复。只处理有把握的几种。"""
     s = raw.strip()
-    if s.startswith("```"):
-        s = s.split("\n", 1)[-1]
-        if s.endswith("```"):
-            s = s[: -3]
-        s = s.strip()
+    # 剥代码围栏。用正则而不是按行切：模型也会把整个对象压成一行
+    # （```json {"path": "a.py"} ```），按 \n 切的话第一行就是全部内容，剥不掉。
+    fenced = _FENCE_FULL.match(s)
+    s = fenced.group(1).strip() if fenced else _FENCE_OPEN.sub("", s).strip()
     # 去掉 } 或 ] 前的多余逗号
     s = _TRAILING_COMMA.sub(r"\1", s)
-    # 括号没闭合就补上（模型被截断时常见）
-    for open_ch, close_ch in (("{", "}"), ("[", "]")):
-        gap = s.count(open_ch) - s.count(close_ch)
-        if gap > 0:
-            s += close_ch * gap
-    return s
+    return _close_brackets(s)
 
 
 def parse_arguments(call: ToolCall) -> dict:
@@ -108,6 +137,29 @@ def parse_arguments(call: ToolCall) -> dict:
     return value
 
 
+_JSON_TYPES = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _matches(value, expected: str) -> bool:
+    """JSON Schema 的类型判断。未知类型一律放行。
+
+    bool 要在数值类型上单独挡掉：Python 里 bool 是 int 的子类，
+    `isinstance(True, int)` 为真，于是 `limit=true` 会静默通过校验，
+    再被当成 1 用 —— 读回一行内容，看上去还成功了。
+    """
+    if expected in ("integer", "number") and isinstance(value, bool):
+        return False
+    py_type = _JSON_TYPES.get(expected)
+    return py_type is None or isinstance(value, py_type)
+
+
 def validate(args: dict, schema: dict, tool_name: str) -> None:
     """极简 schema 校验：必填字段 + 顶层类型。
 
@@ -119,20 +171,11 @@ def validate(args: dict, schema: dict, tool_name: str) -> None:
         if name not in args:
             raise ToolError(f"{tool_name} 缺少必填参数 `{name}`。")
 
-    type_map = {
-        "string": str,
-        "integer": int,
-        "number": (int, float),
-        "boolean": bool,
-        "array": list,
-        "object": dict,
-    }
     for name, value in args.items():
         if name not in props:
             continue  # 多给的参数忽略掉，不值得为此打断模型
         expected = props[name].get("type")
-        py_type = type_map.get(expected)
-        if py_type and not isinstance(value, py_type):
+        if expected and not _matches(value, expected):
             raise ToolError(
                 f"{tool_name} 的参数 `{name}` 应为 {expected}，"
                 f"收到 {type(value).__name__}。"

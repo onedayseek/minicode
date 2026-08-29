@@ -17,6 +17,7 @@ from ..errors import ToolError
 from .base import Tool
 
 DEFAULT_TIMEOUT = 60
+MAX_TIMEOUT = 300
 MAX_OUTPUT = 30_000
 
 # 命令跑完了但退出码非零。对模型来说这是有效信息（测试失败的输出正是它要读的），
@@ -68,6 +69,15 @@ class Shell:
     def path_style(self) -> str:
         return "反斜杠（C:\\path\\to\\file）" if self.kind in ("pwsh", "powershell", "cmd") else "正斜杠（/path/to/file）"
 
+    @property
+    def chain(self) -> str:
+        """把多条命令串进一次调用的分隔符。
+
+        每次调用都是新进程，cd 和环境变量都不留到下一次，所以模型需要连续操作时
+        必须知道用什么串起来 —— 而这又是各解释器不同的：PowerShell 5.1 不支持 &&。
+        """
+        return {"cmd": "&", "powershell": ";"}.get(self.kind, "&&")
+
 
 def resolve_shell() -> Shell:
     """解析出本次会话实际使用的解释器。整个会话内不再变化。"""
@@ -101,6 +111,9 @@ def describe(shell: Shell, root: Path) -> str:
         f"- 调用形式：{shell.invocation}\n"
         f"- 工作目录：{root}（命令已在此目录下执行，不要再 cd 过去）\n"
         f"- 路径风格：{shell.path_style}\n"
+        f"- 超时：默认 {DEFAULT_TIMEOUT} 秒，可用 timeout 参数调整，但上限是 {MAX_TIMEOUT} 秒\n"
+        f"- 每次调用都是一个新进程，cd、环境变量、激活的虚拟环境都不会留到下一次调用。"
+        f"需要连续操作就写在同一条命令里，用 `{shell.chain}` 串起来。\n"
         "命令语法必须符合上面这个解释器，不要假定是别的 shell。"
     )
 
@@ -194,14 +207,20 @@ def make_tools(root: Path, shell: Shell) -> list[Tool]:
 
         proc = subprocess.Popen(shell.argv(command), **kwargs)
         try:
-            out, err = proc.communicate(timeout=min(timeout, 300))
+            out, err = proc.communicate(timeout=min(timeout, MAX_TIMEOUT))
         except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            proc.communicate()
             raise ToolError(
                 f"命令超过 {timeout} 秒未结束，已连同子进程一并终止。"
-                f"如果是长任务，请加大 timeout 或拆成更小的步骤。"
+                f"如果是长任务，请加大 timeout（上限 {MAX_TIMEOUT} 秒）或拆成更小的步骤。"
             )
+        finally:
+            # 超时和 Ctrl-C 都落到这里。后者尤其要收拾：CREATE_NEW_PROCESS_GROUP /
+            # start_new_session 把子进程隔在了另一个进程组里，它收不到终端的 Ctrl-C，
+            # 而 KeyboardInterrupt 会绕过 _dispatch 的 except Exception 一路往上，
+            # 不显式杀就留下一棵还在跑的进程树。正常结束时 poll() 已有退出码，不动。
+            if proc.poll() is None:
+                _kill_tree(proc)
+                proc.communicate()
 
         stdout, stderr = _decode(out), _decode(err)
         parts = []
