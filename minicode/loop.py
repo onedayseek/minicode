@@ -9,7 +9,7 @@ from .errors import FatalError, RetryableError, ToolError, UserAbort
 from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
 from .session import SessionLog
-from .tools import build_registry
+from .tools import Shell, build_registry, resolve_shell
 from .tools.shell import EXIT_PREFIX
 
 MAX_STEPS = 40
@@ -24,14 +24,18 @@ class Stop:
 
 
 class Agent:
-    def __init__(self, llm: LLMClient, root: Path, system_prompt: str, ui, log: SessionLog) -> None:
+    def __init__(
+        self, llm: LLMClient, root: Path, system_prompt: str, ui, log: SessionLog,
+        shell: Shell | None = None,
+    ) -> None:
         self.llm = llm
         self.root = root
         self.ui = ui
         self.log = log
         self.context = Context(system_prompt)
         self.seen_files: set[str] = set()
-        self.tools = build_registry(root, self.seen_files)
+        self.shell = shell or resolve_shell()
+        self.tools = build_registry(root, self.seen_files, self.shell)
         self._nudged = False
 
     def run(self, user_input: str) -> None:

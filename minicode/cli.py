@@ -8,6 +8,7 @@ from .errors import FatalError
 from .llm import LLMClient, load_dotenv
 from .loop import Agent
 from .session import SessionLog, load_session
+from .tools import resolve_shell
 from .ui import UI
 
 HELP = """\
@@ -98,8 +99,14 @@ def main(argv: list[str] | None = None) -> int:
         ui.error(str(e))
         return 2
 
-    log = SessionLog(root, llm.model)
-    agent = Agent(llm, root, load_system_prompt(root), ui, log)
+    try:
+        shell = resolve_shell()
+    except Exception as e:
+        ui.error(str(e))
+        return 2
+
+    log = SessionLog(root, llm.model, shell.executable)
+    agent = Agent(llm, root, load_system_prompt(root), ui, log, shell)
 
     if restored is not None:
         log.inherit(resume_path)
@@ -115,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         agent.run(args.prompt)
         return 0
 
-    ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认", log.path)
+    ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认", log.path, agent.shell)
     while True:
         try:
             line = ui.prompt().strip()

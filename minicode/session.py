@@ -26,13 +26,13 @@ class Restored:
 
 
 class SessionLog:
-    def __init__(self, root: Path, model: str) -> None:
+    def __init__(self, root: Path, model: str, shell: str = "") -> None:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.dir = root / SESSIONS_DIR
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / f"{stamp}-{os.getpid()}.jsonl"
         self._started = time.monotonic()
-        self.event("session_start", model=model, root=str(root))
+        self.event("session_start", model=model, root=str(root), shell=shell)
 
     def event(self, kind: str, **fields) -> None:
         record = {

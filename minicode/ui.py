@@ -107,8 +107,10 @@ class UI:
     def error(self, text: str) -> None:
         self.console.print(f"[bold red]错误[/] {escape(text)}")
 
-    def banner(self, model: str, root, mode: str, log_path) -> None:
+    def banner(self, model: str, root, mode: str, log_path, shell=None) -> None:
         self.console.print(f"\n[bold]minicode[/] · {model} · {root} · {mode}")
+        if shell is not None:
+            self.console.print(f"[dim]命令解释器 {shell.executable}[/]")
         self.console.print(f"[dim]会话记录 {log_path}[/]")
         self.console.print("[dim]/help 查看命令，Ctrl-C 中断当前任务，Ctrl-D 退出[/]\n")
 

@@ -5,9 +5,11 @@ from pathlib import Path
 
 from ..errors import ToolError
 from .base import Tool, resolve
+from .textfile import decode_bytes, normalize
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".minicode", "dist", "build"}
 MAX_HITS = 100
+MAX_SCAN_FILES = 5000
 
 
 def _walk(base: Path):
@@ -41,14 +43,23 @@ def make_tools(root: Path) -> list[Tool]:
             raise ToolError(f"正则表达式非法：{e}")
 
         results = []
+        scanned = 0
         for file in _walk(base):
             if not file.match(include):
                 continue
+            scanned += 1
+            if scanned > MAX_SCAN_FILES:
+                results.append(f"... 已扫描 {MAX_SCAN_FILES} 个文件后停止，请缩小 path 或 include")
+                break
             try:
-                text = file.read_text(encoding="utf-8", errors="ignore")
+                raw = file.read_bytes()
             except OSError:
                 continue
-            for lineno, line in enumerate(text.splitlines(), 1):
+            if b"\x00" in raw[:8000]:
+                continue  # 二进制文件跳过
+            # 和 read_file 用同一套解码，避免非 UTF-8 文件搜不到
+            text = normalize(decode_bytes(raw)[0])
+            for lineno, line in enumerate(text.split("\n"), 1):
                 if regex.search(line):
                     rel = file.relative_to(root)
                     results.append(f"{rel}:{lineno}:{line.strip()[:200]}")
