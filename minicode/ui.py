@@ -13,6 +13,7 @@ import difflib
 import html as html_lib
 import json
 import os
+import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,8 +29,10 @@ from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group
 from rich.markup import escape
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 # 工具结果：几行足够判断「做了什么、成没成」
@@ -49,6 +52,7 @@ LINE_WIDTH = 200
 ARG_INLINE_LIMIT = 72
 # 调用摘要行里主参数的显示宽度
 HEADLINE_WIDTH = 64
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
 ACCENT = "#d97757"
 PRIMARY_MARK = f"[bold {ACCENT}]●[/]"
@@ -225,6 +229,8 @@ class UI:
         self.auto_approve = auto_approve
         self._always: set[str] = set()
         self._streaming = False
+        self._stream_text = ""
+        self._stream_marker_pending = True
         self._status = None
         self._ptk_input = ptk_input
         self._ptk_output = ptk_output
@@ -280,17 +286,39 @@ class UI:
 
     def stream(self, chunk: str) -> None:
         self.stop_thinking()
+        if not chunk:
+            return
         if not self._streaming:
             self.console.print()
-            self.console.print(f"{PRIMARY_MARK} ", end="")
             self._streaming = True
-        self.console.print(escape(chunk), end="", highlight=False)
+            self._stream_text = ""
+            self._stream_marker_pending = True
+        self._stream_text += chunk
+
+        blocks, self._stream_text = _complete_markdown_blocks(self._stream_text)
+        for block in blocks:
+            self._print_stream_block(block)
 
     def end_stream(self) -> None:
         self.stop_thinking()
         if self._streaming:
-            self.console.print()
+            if self._stream_text:
+                self._print_stream_block(self._stream_text)
             self._streaming = False
+            self._stream_text = ""
+            self._stream_marker_pending = True
+
+    def _print_stream_block(self, text: str) -> None:
+        """稳定块只追加一次；已打印内容永不参与后续刷新。"""
+        marker = self._stream_marker_pending
+        try:
+            self.console.print(_safe_markdown_response(text.rstrip(), marker=marker))
+        except Exception:
+            try:
+                self.console.print(_plain_response(text.rstrip(), marker=marker))
+            except Exception:
+                pass  # UI 失败不能终止 agent，会话日志仍保留完整回复
+        self._stream_marker_pending = False
 
     def retry_notice(self, reason: str, partial: bool) -> None:
         """请求失败、正在退避重试。
@@ -546,7 +574,10 @@ class UI:
             elif role == "assistant":
                 if content:
                     self.console.print()
-                    self.console.print(f"{PRIMARY_MARK} {escape(content)}", highlight=False)
+                    try:
+                        self.console.print(_safe_markdown_response(content))
+                    except Exception:
+                        self.console.print(_plain_response(content))
                 for call in message.get("tool_calls") or []:
                     pending[call.get("id", "")] = call
             elif role == "tool":
@@ -616,3 +647,63 @@ def _display_arguments(raw) -> dict:
     except (json.JSONDecodeError, TypeError):
         return {"arguments": str(raw)}
     return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+
+
+def _markdown_response(text: str, marker: bool = True) -> Table:
+    """模型回复的统一视图：固定事件标记 + Rich Markdown 正文。"""
+    table = Table.grid(padding=(0, 1), expand=True)
+    table.add_column(width=1, no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        Text("●", style=f"bold {ACCENT}") if marker else Text(""),
+        Markdown(text, code_theme="monokai", hyperlinks=True),
+    )
+    return table
+
+
+def _plain_response(text: str, marker: bool = True) -> Table:
+    """Markdown 解析或渲染失败时保留完整内容。"""
+    table = Table.grid(padding=(0, 1), expand=True)
+    table.add_column(width=1, no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        Text("●", style=f"bold {ACCENT}") if marker else Text(""),
+        Text(text),
+    )
+    return table
+
+
+def _safe_markdown_response(text: str, marker: bool = True) -> Table:
+    try:
+        return _markdown_response(text, marker=marker)
+    except Exception:
+        return _plain_response(text, marker=marker)
+
+
+def _complete_markdown_blocks(text: str) -> tuple[list[str], str]:
+    """取出空行结尾且不在 fenced code 内的稳定 Markdown 块。"""
+    blocks: list[str] = []
+    start = 0
+    position = 0
+    fence_char = ""
+    fence_length = 0
+
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        match = _FENCE_RE.match(body)
+        if match:
+            fence = match.group(1)
+            if not fence_char:
+                fence_char, fence_length = fence[0], len(fence)
+            elif fence[0] == fence_char and len(fence) >= fence_length:
+                fence_char, fence_length = "", 0
+
+        position += len(line)
+        complete_line = line.endswith(("\n", "\r"))
+        if not fence_char and complete_line and not body.strip():
+            block = text[start:position]
+            if block.strip():
+                blocks.append(block)
+            start = position
+
+    return blocks, text[start:]

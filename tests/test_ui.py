@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-
-from minicode.ui import PRIMARY_MARK, UI
+import minicode.ui as ui_module
+from minicode.ui import UI
 
 
 def test_工具摘要使用动作名并突出主参数(capsys):
@@ -17,18 +17,82 @@ def test_工具摘要使用动作名并突出主参数(capsys):
     assert "start_line=10" in output
 
 
-def test_模型回复和所有工具调用共用同一个主事件标记(monkeypatch):
-    calls = []
+def test_模型回复和所有工具调用共用同一个主事件标记(capsys):
     ui = UI()
-    monkeypatch.setattr(ui.console, "print", lambda *args, **kwargs: calls.append(args))
 
     ui.stream("回复")
     ui.end_stream()
     ui.tool_start("read_file", {"path": "app.py"}, "path")
     ui.tool_start("shell", {"command": "pytest"}, "command")
 
-    markers = [args[0] for args in calls if args and PRIMARY_MARK in str(args[0])]
-    assert len(markers) == 3
+    assert capsys.readouterr().out.count("●") == 3
+
+
+def test_模型回复支持Markdown渲染(capsys):
+    ui = UI()
+    ui.stream("## 结果\n\n这是 **重点**。\n\n```python\nprint('ok')\n```")
+    ui.end_stream()
+
+    output = capsys.readouterr().out
+    for expected in ("结果", "这是 重点。", "print('ok')"):
+        assert expected in output
+    assert "**" not in output
+    assert "```" not in output
+
+
+def test_分块到达的Markdown按完整回复解析(capsys):
+    ui = UI()
+    ui.stream("这是 **重")
+    ui.stream("点**")
+    ui.end_stream()
+
+    output = capsys.readouterr().out
+    assert "这是 重点" in output
+    assert "**" not in output
+
+
+def test_未完成的Markdown块不会提前交给解析器(monkeypatch):
+    ui = UI()
+    real_render = ui_module._markdown_response
+    parsed = []
+
+    def tracking_render(text, marker=True):
+        parsed.append(text)
+        return real_render(text, marker=marker)
+
+    monkeypatch.setattr(ui_module, "_markdown_response", tracking_render)
+    ui.stream("链接：[文档](https://")
+    assert parsed == []
+    ui.stream("example.com)\n\n")
+    ui.end_stream()
+
+    assert parsed == ["链接：[文档](https://example.com)"]
+
+
+def test_已输出的Markdown块不会在后续chunk中重复渲染(capsys):
+    ui = UI()
+    ui.stream("第一段\n\n")
+    ui.stream("第二段\n\n")
+    ui.end_stream()
+
+    output = capsys.readouterr().out
+    assert output.count("第一段") == 1
+    assert output.count("第二段") == 1
+    assert output.count("●") == 1
+
+
+def test_最终Markdown解析失败时降级为原始文本(monkeypatch, capsys):
+    ui = UI()
+    monkeypatch.setattr(
+        ui_module,
+        "_markdown_response",
+        lambda _text: (_ for _ in ()).throw(IndexError("parser bug")),
+    )
+
+    ui.stream("[未闭合](https://")
+    ui.end_stream()
+
+    assert "[未闭合](https://" in capsys.readouterr().out
 
 
 def test_审批支持三选一并记住本会话选择(monkeypatch):
@@ -154,7 +218,7 @@ def test_恢复历史会显示用户模型和工具轨迹(capsys):
         {"role": "user", "content": "先检查项目"},
         {
             "role": "assistant",
-            "content": "我先读取入口。",
+            "content": "我先读取 **入口**。",
             "tool_calls": [
                 {
                     "id": "A",
@@ -174,5 +238,6 @@ def test_恢复历史会显示用户模型和工具轨迹(capsys):
     ui.show_history(messages, {"A": "ok"})
 
     output = capsys.readouterr().out
-    for expected in ("已恢复的对话", "❯ 先检查项目", "● 我先读取入口。", "Read(app.py)", "⎿ 读取完成", "继续会话"):
+    for expected in ("已恢复的对话", "❯ 先检查项目", "● 我先读取 入口。", "Read(app.py)", "⎿ 读取完成", "继续会话"):
         assert expected in output
+    assert "**" not in output
