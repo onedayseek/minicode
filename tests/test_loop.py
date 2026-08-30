@@ -123,6 +123,53 @@ def test_相同调用重复失败先提示再终止(agent):
     assert agent._execute([call("D")], stuck) is True  # 还是原封不动的调用，终止
 
 
+def test_多调用中触发提示时先闭合整组(agent):
+    calls = [call("A"), call("B", "grep", '{"pattern":"x"}')]
+    agent.context.add_assistant("", calls)
+    stuck = StuckDetector()
+    stuck._repeats[fingerprint(calls[0])] = 1
+
+    assert agent._execute(calls, stuck) is False
+    assert_groups_valid(agent.context.messages)
+    assert [m["role"] for m in agent.context.messages[-3:]] == ["tool", "tool", "system"]
+    assert agent.log.system_notes
+
+
+def test_多调用中决定终止时补齐剩余结果(agent):
+    calls = [call("A"), call("B", "grep", '{"pattern":"x"}')]
+    agent.context.add_assistant("", calls)
+    stuck = StuckDetector()
+    stuck.nudged = True
+    stuck._repeats[fingerprint(calls[0])] = 1
+
+    assert agent._execute(calls, stuck) is True
+    assert_groups_valid(agent.context.messages)
+    results = [m for m in agent.context.messages if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in results] == ["A", "B"]
+    assert "未执行" in results[-1]["content"]
+
+
+def test_长度截断的工具调用不会执行(agent):
+    agent.llm = ScriptedLLM([
+        Reply(
+            tool_calls=[call("A", "write_file", '{"path":"x.py","content":"half')],
+            finish_reason="length",
+        )
+    ])
+
+    assert agent.run("写文件") is False
+    assert not any(m["role"] == "assistant" for m in agent.context.messages)
+    assert not any(m["role"] == "tool" for m in agent.context.messages)
+
+
+def test_工具内部异常的traceback写入日志(agent):
+    tool = agent.tools.get("read_file")
+    tool.run = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("内部坏了"))
+
+    assert agent._dispatch(call("A", arguments='{"path":"a.py"}')) is False
+    assert "RuntimeError: 内部坏了" in agent.log.internal_errors[-1]
+
+
 def test_换参数的失败不算原地打转(agent):
     """连读三个猜错的路径是正常试探。按工具名计数会把这种情况误判成卡死。"""
     stuck = StuckDetector()

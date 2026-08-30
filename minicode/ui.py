@@ -42,10 +42,6 @@ RESULT_TAIL = 1
 # 编辑的 diff 给得宽些：改动行本身就是要看的东西，砍掉就没意义了
 DIFF_MAX_LINES = 12
 DIFF_CONTEXT = 3
-# 调用参数：给得宽，模型写的命令和文件内容是审批的依据
-ARG_MAX_LINES = 24
-ARG_HEAD = 16
-ARG_TAIL = 6
 # 单行过长时的截断宽度
 LINE_WIDTH = 200
 # 参数值超过这个长度就换行独立显示，而不是挤在一行里
@@ -336,7 +332,7 @@ class UI:
     # ---- 工具调用 ----
 
     def tool_start(self, name: str, args: dict, primary: str | None = None) -> None:
-        """摘要一行 + 完整参数。参数不截断 —— 那是批不批准这次操作的依据。"""
+        """摘要一行 + 完整参数。审批依据不做内容截断。"""
         self.stop_thinking()
         self.console.print()
         label = TOOL_LABELS.get(name, name)
@@ -351,7 +347,7 @@ class UI:
                 continue  # 短参数已经完整出现在摘要行里了
             text = value if isinstance(value, str) else str(value)
             self.console.print(f"[dim]  │ {key}:[/]")
-            for line in clip(text, ARG_MAX_LINES, ARG_HEAD, ARG_TAIL).splitlines():
+            for line in text.splitlines() or [""]:
                 self.console.print(f"[dim]  │[/] {escape(line)}")
 
     def _preview_edit(self, args: dict) -> bool:
@@ -366,7 +362,7 @@ class UI:
         lines = _diff_lines(old, new)
         if not lines:
             return False
-        for line in clip("\n".join(lines), ARG_MAX_LINES, ARG_HEAD, ARG_TAIL).splitlines():
+        for line in lines:
             self.console.print(f"[dim]  │[/] [{_diff_style(line)}]{escape(line)}[/]")
         return True
 

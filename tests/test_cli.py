@@ -9,8 +9,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+import minicode.cli as cli_module
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -102,3 +105,55 @@ def test_从会话恢复(tmp_path):
     new = [p for p in sessions.glob("*.jsonl") if p.name != "old.jsonl"][0]
     kinds = [json.loads(l)["kind"] for l in new.read_text(encoding="utf-8").splitlines()]
     assert "resumed_from" in kinds and "user" in kinds
+
+
+def fake_cli(monkeypatch, inputs, run_result=True):
+    captured = []
+    ui = SimpleNamespace(
+        prompt=lambda: next(inputs),
+        console=SimpleNamespace(print=lambda *_args, **_kwargs: None),
+        banner=lambda *_args, **_kwargs: None,
+        notice=lambda *_args, **_kwargs: None,
+        error=lambda *_args, **_kwargs: None,
+        status_line="",
+    )
+    log = SimpleNamespace(
+        path=Path("fake.jsonl"),
+        event=lambda *_args, **_kwargs: None,
+        stop=lambda *_args, **_kwargs: None,
+    )
+    shell = SimpleNamespace(executable="shell", kind="pwsh")
+    llm = SimpleNamespace(model="test")
+
+    class FakeAgent:
+        def __init__(self, *_args, **_kwargs):
+            self.context = SimpleNamespace(reset=lambda: None)
+            self.seen_files = set()
+            self.shell = shell
+
+        def run(self, text):
+            captured.append(text)
+            return run_result
+
+    monkeypatch.setattr(cli_module, "UI", lambda **_kwargs: ui)
+    monkeypatch.setattr(cli_module, "SessionLog", lambda *_args, **_kwargs: log)
+    monkeypatch.setattr(cli_module, "Agent", FakeAgent)
+    monkeypatch.setattr(cli_module, "resolve_shell", lambda: shell)
+    monkeypatch.setattr(cli_module.LLMClient, "from_env", lambda: llm)
+    monkeypatch.setattr(cli_module, "load_dotenv", lambda _path: None)
+    monkeypatch.setattr(cli_module, "load_system_prompt", lambda _root: "system")
+    return captured
+
+
+def test_交互输入传给agent时保留首尾空白(tmp_path, monkeypatch):
+    captured = fake_cli(monkeypatch, iter(("  第一行\n    第二行  ", "/exit")))
+
+    assert cli_module.main(["-C", str(tmp_path)]) == 0
+    assert captured == ["  第一行\n    第二行  "]
+
+
+def test_单次模式异常终止返回非零(tmp_path, monkeypatch):
+    captured = fake_cli(monkeypatch, iter(()), run_result=False)
+
+    assert cli_module.main(["-C", str(tmp_path), "-p", "任务"]) == 1
+    assert captured == ["任务"]

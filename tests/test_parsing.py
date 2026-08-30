@@ -130,10 +130,16 @@ def test_按嵌套顺序补括号():
     assert parsed('{"a": {"b": ["c"') == {"a": {"b": ["c"]}}
 
 
-def test_字符串里的括号不算数():
+def test_完整字符串里的括号不算数():
     """写代码是最常见的用法，content 里带 { 再正常不过。"""
-    got = parsed('{"path": "a.py", "content": "def f() {')
+    got = parsed('{"path": "a.py", "content": "def f() {"}')
     assert got == {"path": "a.py", "content": "def f() {"}
+
+
+def test_截断在字符串内部时拒绝修复():
+    """无法知道字符串后半段是什么，补引号会把半份写入内容当成完整调用执行。"""
+    with pytest.raises(ToolError, match="不是合法 JSON"):
+        parsed('{"path": "a.py", "content": "def f() {')
 
 
 def test_转义引号不会被当成字符串结束():
@@ -190,7 +196,8 @@ def test_整数可以当number():
 
 def test_多给的参数被忽略():
     """不值得为模型多塞一个字段就打断它。"""
-    validate({"path": "a.py", "没这个参数": 1}, SCHEMA, "read_file")
+    got = validate({"path": "a.py", "没这个参数": 1}, SCHEMA, "read_file")
+    assert got == {"path": "a.py"}
 
 
 def test_没写类型的字段放行():

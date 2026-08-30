@@ -64,10 +64,12 @@ class SessionLog:
     def user(self, text: str) -> None:
         self.event("user", text=text)
 
-    def request(self, step: int, messages: list[dict], tools: list[str]) -> None:
-        self.event("request", step=step, n_messages=len(messages), tools=tools)
+    def request(self, step: int, messages: list[dict], tools: list[dict]) -> None:
+        # 保存真正发送给 provider 的快照。事件写入会立即 JSON 序列化，后续上下文
+        # 原地裁剪不会反过来修改这份记录。
+        self.event("request", step=step, messages=messages, tools=tools)
 
-    def reply(self, step: int, text: str, tool_calls, usage) -> None:
+    def reply(self, step: int, text: str, tool_calls, usage, finish_reason=None) -> None:
         self.event(
             "reply",
             step=step,
@@ -77,6 +79,7 @@ class SessionLog:
             completion_tokens=usage.completion_tokens,
             cache_hit_tokens=usage.cache_hit_tokens,
             cache_miss_tokens=usage.cache_miss_tokens,
+            finish_reason=finish_reason,
         )
 
     def tool_result(self, call, status: str, content: str) -> None:
@@ -90,6 +93,20 @@ class SessionLog:
 
     def stop(self, reason: str) -> None:
         self.event("stop", reason=reason)
+
+    def system_note(self, content: str) -> None:
+        self.event("system_note", content=content)
+
+    def context_elision(self, notice: str, changes: list[dict]) -> None:
+        self.event("context_elision", notice=notice, changes=changes)
+
+    def internal_error(self, call, traceback_text: str) -> None:
+        self.event(
+            "internal_error",
+            id=call.id,
+            name=call.name,
+            traceback=traceback_text,
+        )
 
 
 def iter_events(path: Path):
@@ -110,7 +127,8 @@ def iter_events(path: Path):
 def load_session(path: Path) -> "Restored":
     """从会话记录重建可继续的上下文。
 
-    消息数组不含 system 消息，可直接 extend 到 Context.messages 后面。
+    消息数组不含开头的主 system prompt，但包含运行中注入的 system note，
+    可直接 extend 到 Context.messages 后面。
 
     重建时以「消息组」为单位丢弃未闭合的 tool_calls —— API 要求 role=tool 的消息
     必须紧跟在带 tool_calls 的 assistant 之后。中断可能只留下一组里的部分结果，
@@ -122,16 +140,20 @@ def load_session(path: Path) -> "Restored":
     prompt_tokens = 0
     read_paths: list[str] = []
     tool_statuses: dict[str, str] = {}
+    touched_by_call: dict[str, str] = {}
     # 每组：[assistant 消息下标, 尚未闭合的 call id, 本组 tool 消息的下标]
     groups: list[list] = []
     drop: set[int] = set()
 
     def reset() -> None:
+        nonlocal prompt_tokens
         messages.clear()
         read_paths.clear()
         tool_statuses.clear()
+        touched_by_call.clear()
         groups.clear()
         drop.clear()
+        prompt_tokens = 0
 
     for ev in iter_events(path):
         kind = ev.get("kind")
@@ -156,13 +178,15 @@ def load_session(path: Path) -> "Restored":
                     for c in calls
                 ]
                 groups.append([len(messages), {c["id"] for c in calls}, []])
-                read_paths.extend(_touched_paths(calls))
+                touched_by_call.update(_touched_paths(calls))
             messages.append(msg)
 
         elif kind == "tool_result":
             call_id = ev.get("id")
             if isinstance(call_id, str):
                 tool_statuses[call_id] = ev.get("status", "ok")
+                if ev.get("status", "ok") != "fail" and call_id in touched_by_call:
+                    read_paths.append(touched_by_call[call_id])
             index = len(messages)
             messages.append(
                 {
@@ -183,6 +207,17 @@ def load_session(path: Path) -> "Restored":
         elif kind == "clear":
             reset()
 
+        elif kind == "system_note":
+            messages.append({"role": "system", "content": ev.get("content", "")})
+
+        elif kind == "context_elision":
+            for change in ev.get("changes") or []:
+                call_id = change.get("tool_call_id")
+                for message in reversed(messages):
+                    if message.get("role") == "tool" and message.get("tool_call_id") == call_id:
+                        message["content"] = change.get("content", message.get("content", ""))
+                        break
+
     for assistant_index, unclosed, tool_indices in groups:
         if not unclosed:
             continue
@@ -202,9 +237,9 @@ def load_session(path: Path) -> "Restored":
     )
 
 
-def _touched_paths(calls: list[dict]) -> list[str]:
-    """从工具调用参数里取出被读过/写过的文件，用于恢复 read-before-edit 的记录。"""
-    paths = []
+def _touched_paths(calls: list[dict]) -> dict[str, str]:
+    """记录调用 id 与候选路径；只有成功结果到达后才恢复为已读。"""
+    paths = {}
     for call in calls:
         if call.get("name") not in ("read_file", "write_file"):
             continue
@@ -213,5 +248,7 @@ def _touched_paths(calls: list[dict]) -> list[str]:
         except json.JSONDecodeError:
             continue
         if isinstance(args, dict) and isinstance(args.get("path"), str):
-            paths.append(args["path"])
+            call_id = call.get("id")
+            if isinstance(call_id, str):
+                paths[call_id] = args["path"]
     return paths

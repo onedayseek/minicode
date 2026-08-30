@@ -30,6 +30,7 @@ class Reply:
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str | None = None
 
 
 class ToolCallAccumulator:
@@ -81,7 +82,8 @@ def _close_brackets(s: str) -> str:
     - 顺序会错。`{"tags": ["x"` 先补 `}` 再补 `]` 得到 `["x"}]`，照样不合法。
     - 字符串字面量里的括号不算数。`{"content": "def f() {` 会被多算一个。
 
-    所以扫一遍维护栈，顺带把截断在半路的字符串也收尾。
+    所以扫一遍维护栈。只补结构括号，不补截断在半路的字符串：字符串内容
+    无法可靠还原，擅自补引号可能让半份 write_file 内容被当成完整参数执行。
     """
     stack: list[str] = []
     in_string = False
@@ -102,7 +104,7 @@ def _close_brackets(s: str) -> str:
         elif ch in "}]" and stack and stack[-1] == ch:
             stack.pop()
     if in_string:
-        s += '"'
+        return s
     return s + "".join(reversed(stack))
 
 
@@ -160,7 +162,7 @@ def _matches(value, expected: str) -> bool:
     return py_type is None or isinstance(value, py_type)
 
 
-def validate(args: dict, schema: dict, tool_name: str) -> None:
+def validate(args: dict, schema: dict, tool_name: str) -> dict:
     """极简 schema 校验：必填字段 + 顶层类型。
 
     不引入 jsonschema/pydantic：实际要覆盖的只有『字段缺失』和『类型写错』
@@ -171,12 +173,15 @@ def validate(args: dict, schema: dict, tool_name: str) -> None:
         if name not in args:
             raise ToolError(f"{tool_name} 缺少必填参数 `{name}`。")
 
+    validated = {}
     for name, value in args.items():
         if name not in props:
-            continue  # 多给的参数忽略掉，不值得为此打断模型
+            continue  # 多给的参数从实际调用中移除，不值得为此打断模型
         expected = props[name].get("type")
         if expected and not _matches(value, expected):
             raise ToolError(
                 f"{tool_name} 的参数 `{name}` 应为 {expected}，"
                 f"收到 {type(value).__name__}。"
             )
+        validated[name] = value
+    return validated

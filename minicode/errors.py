@@ -15,9 +15,21 @@ class ToolError(MinicodeError):
 class RetryableError(MinicodeError):
     """框架能自己修：限流、5xx、连接中断。指数退避后重试。"""
 
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class FatalError(MinicodeError):
     """必须终止：认证失败、余额不足、配置缺失。给用户明确指引后退出。"""
+
+
+class ContextLimitError(MinicodeError):
+    """请求超过模型上下文窗口，需要压缩或清空历史。"""
+
+
+class ProtocolError(MinicodeError):
+    """消息序列违反 provider 的工具调用协议。"""
 
 
 class UserAbort(MinicodeError):

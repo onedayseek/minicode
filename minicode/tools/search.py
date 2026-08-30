@@ -100,7 +100,10 @@ def make_tools(root: Path) -> list[Tool]:
             if b"\x00" in raw[:8000]:
                 continue  # 二进制文件跳过
             # 和 read_file 用同一套解码，避免非 UTF-8 文件搜不到
-            text = normalize(decode_bytes(raw)[0])
+            try:
+                text = normalize(decode_bytes(raw)[0])
+            except ToolError:
+                continue
             for lineno, line in enumerate(text.split("\n"), 1):
                 if regex.search(line):
                     rel = file.relative_to(root)

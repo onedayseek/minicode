@@ -46,6 +46,8 @@ def make_tools(root: Path, seen: set) -> list[Tool]:
         return read_source(target)
 
     def read_file(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
+        if limit < 1:
+            raise ToolError("limit 必须是大于 0 的整数。")
         target = resolve(root, path)
         if not target.exists():
             siblings = (

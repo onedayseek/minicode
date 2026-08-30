@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from conftest import assert_groups_valid
-from minicode.session import load_session
+from minicode.session import SessionLog, iter_events, load_session
 
 
 def write_log(tmp_path: Path, events: list[dict]) -> Path:
@@ -92,6 +92,14 @@ def test_clear清空已有历史(tmp_path):
     assert [m["role"] for m in r.messages] == ["user"]
 
 
+def test_clear同时清空旧token数(tmp_path):
+    log = write_log(
+        tmp_path,
+        [START, USER, reply(tokens=60000), {"kind": "clear"}, USER],
+    )
+    assert load_session(log).prompt_tokens == 0
+
+
 def test_坏行被跳过(tmp_path):
     path = tmp_path / "s.jsonl"
     path.write_text(
@@ -125,6 +133,44 @@ def test_恢复已读文件列表(tmp_path):
     }
 
 
+def test_失败或未返回的读取不恢复为已读(tmp_path):
+    log = write_log(
+        tmp_path,
+        [
+            {"kind": "session_start", "root": str(tmp_path), "model": "test"},
+            USER,
+            reply(
+                ("A", "read_file", '{"path":"failed.py"}'),
+                ("B", "read_file", '{"path":"pending.py"}'),
+            ),
+            {**result("A"), "status": "fail"},
+        ],
+    )
+    assert load_session(log).seen_files == set()
+
+
+def test_框架提示与上下文裁剪可重建(tmp_path):
+    shortened = "开头\n... 已省略"
+    log = write_log(
+        tmp_path,
+        [
+            START,
+            USER,
+            reply(("A", "read_file", '{"path":"a.py"}')),
+            result("A", content="完整内容"),
+            {
+                "kind": "context_elision",
+                "notice": "省略一条",
+                "changes": [{"tool_call_id": "A", "content": shortened}],
+            },
+            {"kind": "system_note", "content": "换一种思路"},
+        ],
+    )
+    restored = load_session(log)
+    assert restored.messages[-2]["content"] == shortened
+    assert restored.messages[-1] == {"role": "system", "content": "换一种思路"}
+
+
 def test_参数非法不影响重建(tmp_path):
     log = write_log(tmp_path, [START, USER, reply(("A", "read_file", "不是 json")), result("A")])
     r = load_session(log)
@@ -146,3 +192,15 @@ def test_恢复工具状态供历史展示使用(tmp_path):
         [START, USER, reply(("A", "shell", "{}")), {**result("A", "shell"), "status": "warn"}],
     )
     assert load_session(log).tool_statuses == {"A": "warn"}
+
+
+def test_request记录实际消息与完整工具schema(tmp_path):
+    log = SessionLog(tmp_path, "test")
+    messages = [{"role": "system", "content": "系统提示"}]
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+
+    log.request(1, messages, tools)
+
+    request = [e for e in iter_events(log.path) if e.get("kind") == "request"][0]
+    assert request["messages"] == messages
+    assert request["tools"] == tools

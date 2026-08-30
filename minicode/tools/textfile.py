@@ -7,6 +7,7 @@
 
 import locale
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,11 +40,19 @@ def normalize(text: str) -> str:
 def decode_bytes(raw: bytes) -> tuple[str, str, bool]:
     """返回 (文本, 编码名, 是否有 BOM)。"""
     if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8", errors="replace"), "utf-8", True
+        try:
+            return raw[3:].decode("utf-8"), "utf-8", True
+        except UnicodeDecodeError as e:
+            raise ToolError("文件带 UTF-8 BOM，但正文不是合法 UTF-8，已拒绝替换坏字节。") from e
     try:
         return raw.decode("utf-8"), "utf-8", False
     except UnicodeDecodeError:
-        return raw.decode(_FALLBACK_ENCODING, errors="replace"), _FALLBACK_ENCODING, False
+        try:
+            return raw.decode(_FALLBACK_ENCODING), _FALLBACK_ENCODING, False
+        except UnicodeDecodeError as e:
+            raise ToolError(
+                f"文件既不是合法 UTF-8，也无法用系统编码 {_FALLBACK_ENCODING} 无损解码。"
+            ) from e
 
 
 def detect_eol(text: str) -> tuple[str, bool]:
@@ -91,11 +100,25 @@ def write_source(path: Path, text: str, meta: TextMeta) -> None:
     if meta.eol != "\n":
         body = body.replace("\n", meta.eol)
 
-    raw = body.encode(meta.encoding, errors="replace")
+    try:
+        raw = body.encode(meta.encoding)
+    except UnicodeEncodeError as e:
+        raise ToolError(
+            f"新内容包含 {meta.encoding} 无法表示的字符，已拒绝写入，原文件未修改。"
+        ) from e
     if meta.bom:
         raw = b"\xef\xbb\xbf" + raw
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".minicode.tmp")
-    tmp.write_bytes(raw)
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".minicode.tmp",
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)

@@ -17,6 +17,17 @@ def test_工具摘要使用动作名并突出主参数(capsys):
     assert "start_line=10" in output
 
 
+def test_审批参数完整显示不隐藏中段(capsys):
+    ui = UI()
+    command = "\n".join(f"line-{i}" for i in range(40))
+
+    ui.tool_start("shell", {"command": command}, "command")
+
+    output = capsys.readouterr().out
+    assert "line-0" in output and "line-20" in output and "line-39" in output
+    assert "省略" not in output
+
+
 def test_模型回复和所有工具调用共用同一个主事件标记(capsys):
     ui = UI()
 

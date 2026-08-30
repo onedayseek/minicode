@@ -6,7 +6,8 @@ import pytest
 
 from minicode.errors import ToolError
 from minicode.tools import build_registry
-from minicode.tools.textfile import TextMeta, detect_eol, read_source, write_source
+from minicode.tools import textfile
+from minicode.tools.textfile import TextMeta, decode_bytes, detect_eol, read_source, write_source
 
 
 @pytest.fixture
@@ -114,3 +115,37 @@ def test_read_before_edit仍然生效(tools, tmp_path):
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     with pytest.raises(ToolError, match="请先用 read_file"):
         run["edit_file"]("a.py", "x = 1", "x = 2")
+
+
+def test_read_file拒绝负数limit(tools, tmp_path):
+    run, _ = tools
+    (tmp_path / "a.py").write_text("a\nb\nc\n", encoding="utf-8")
+    with pytest.raises(ToolError, match="大于 0"):
+        run["read_file"]("a.py", limit=-1)
+
+
+def test_原编码无法表示新字符时不修改文件(tmp_path):
+    target = tmp_path / "ascii.txt"
+    target.write_bytes(b"original\n")
+    meta = TextMeta(encoding="ascii", final_newline=True)
+
+    with pytest.raises(ToolError, match="原文件未修改"):
+        write_source(target, "emoji: 😀\n", meta)
+    assert target.read_bytes() == b"original\n"
+
+
+def test_无法无损解码时不替换坏字节(monkeypatch):
+    monkeypatch.setattr(textfile, "_FALLBACK_ENCODING", "ascii")
+    with pytest.raises(ToolError, match="无损解码"):
+        decode_bytes(b"\xff")
+
+
+def test_原子写入不占用固定同名临时文件(tmp_path):
+    target = tmp_path / "a.py"
+    companion = tmp_path / "a.py.minicode.tmp"
+    companion.write_text("用户文件", encoding="utf-8")
+
+    write_source(target, "x = 1\n", TextMeta())
+
+    assert target.read_text(encoding="utf-8") == "x = 1\n"
+    assert companion.read_text(encoding="utf-8") == "用户文件"

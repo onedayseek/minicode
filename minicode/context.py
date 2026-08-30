@@ -7,12 +7,20 @@
 TODO(v2): 硬阈值下的 LLM 摘要式压缩。
 """
 
+from dataclasses import dataclass
+
 from .parsing import ToolCall
 
 # DeepSeek-chat 的上下文窗口。换 provider 时由 CLI 覆盖。
 DEFAULT_WINDOW = 64_000
 SOFT_RATIO = 0.7  # 超过就开始省略旧工具输出
 ELIDE_KEEP = 200  # 省略后为旧工具结果保留的字符数
+
+
+@dataclass
+class Elision:
+    notice: str
+    changes: list[dict]
 
 
 class Context:
@@ -62,8 +70,8 @@ class Context:
 
     # ---- 预算 ----
 
-    def ensure_budget(self) -> str | None:
-        """超过软阈值时省略较早的工具输出。返回一句给用户看的说明，或 None。
+    def ensure_budget(self) -> Elision | None:
+        """超过软阈值时省略较早的工具输出，返回可记录的裁剪事件或 None。
 
         只改 tool 消息的 content，不删任何消息 —— 这样 assistant.tool_calls
         和它的 tool 结果永远成组存在，不会触发 API 的配对校验错误。
@@ -73,6 +81,7 @@ class Context:
 
         # 最近 6 条消息原样保留，模型正在依赖它们
         elided = 0
+        changes = []
         for msg in self.messages[:-6]:
             if msg["role"] != "tool":
                 continue
@@ -84,7 +93,16 @@ class Context:
                 + f"\n... 此处省略 {len(content) - ELIDE_KEEP} 字符，"
                 f"需要时请重新调用 {msg['name']} 获取 [已省略]"
             )
+            changes.append(
+                {
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "content": msg["content"],
+                }
+            )
             elided += 1
         if elided:
-            return f"上下文已用 {self.usage_ratio():.0%}，省略了 {elided} 条较早的工具输出"
+            return Elision(
+                f"上下文已用 {self.usage_ratio():.0%}，省略了 {elided} 条较早的工具输出",
+                changes,
+            )
         return None

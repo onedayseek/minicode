@@ -117,8 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         agent.seen_files.update(restored.seen_files)
 
     if args.prompt:
-        agent.run(args.prompt)
-        return 0
+        return 0 if agent.run(args.prompt) else 1
 
     ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认", log.path, agent.shell)
     if restored is not None:
@@ -129,30 +128,31 @@ def main(argv: list[str] | None = None) -> int:
         ui.show_history(restored.messages, restored.tool_statuses)
     while True:
         try:
-            line = ui.prompt().strip()
+            line = ui.prompt()
         except (EOFError, KeyboardInterrupt):
             ui.console.print()
             return 0
 
-        if not line:
+        command = line.strip()
+        if not command:
             continue
-        if line.startswith("/"):
-            if line in ("/exit", "/quit"):
+        if command.startswith("/"):
+            if command in ("/exit", "/quit"):
                 return 0
-            if line == "/help":
+            if command == "/help":
                 ui.console.print(HELP)
-            elif line == "/clear":
+            elif command == "/clear":
                 agent.context.reset()
                 agent.seen_files.clear()
                 ui.status_line = ""
                 log.event("clear")
                 ui.notice("已清空对话历史")
-            elif line == "/status":
+            elif command == "/status":
                 ui.show_status()
-            elif line == "/log":
+            elif command == "/log":
                 ui.notice(str(log.path))
             else:
-                ui.notice(f"未知命令 {line}，试试 /help")
+                ui.notice(f"未知命令 {command}，试试 /help")
             continue
 
         try:

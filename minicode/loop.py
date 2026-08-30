@@ -2,11 +2,19 @@
 
 import json
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 from .context import Context
-from .errors import FatalError, RetryableError, ToolError, UserAbort
+from .errors import (
+    ContextLimitError,
+    FatalError,
+    ProtocolError,
+    RetryableError,
+    ToolError,
+    UserAbort,
+)
 from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
 from .session import SessionLog
@@ -89,7 +97,7 @@ class Agent:
         self.shell = shell or resolve_shell()
         self.tools = build_registry(root, self.seen_files, self.shell)
 
-    def run(self, user_input: str) -> None:
+    def run(self, user_input: str) -> bool:
         self.log.user(user_input)
         self.context.add_user(user_input)
         started = time.monotonic()
@@ -102,43 +110,65 @@ class Agent:
             if stop:
                 self.log.stop(stop.reason)
                 self.ui.notice(stop.reason)
-                return
+                return False
 
-            note = self.context.ensure_budget()
-            if note:
-                self.ui.notice(note)
+            elision = self.context.ensure_budget()
+            if elision:
+                self.log.context_elision(elision.notice, elision.changes)
+                self.ui.notice(elision.notice)
 
-            self.log.request(step, self.context.render(), [t["function"]["name"] for t in self.tools.schemas()])
+            schemas = self.tools.schemas()
+            self.log.request(step, self.context.render(), schemas)
             self.ui.start_thinking()
             try:
                 reply = self.llm.chat(
                     self.context.render(),
-                    self.tools.schemas(),
+                    schemas,
                     on_text=self.ui.stream,
                     on_retry=self.ui.retry_notice,
                 )
             except RetryableError as e:
                 self.log.stop(f"网络重试已用尽：{e}")
                 self.ui.notice(f"网络重试已用尽：{e}")
-                return
+                return False
+            except ContextLimitError as e:
+                self.log.stop(f"上下文错误：{e}")
+                self.ui.error(str(e))
+                return False
+            except ProtocolError as e:
+                self.log.stop(f"工具协议错误：{e}")
+                self.ui.error(str(e))
+                return False
             except FatalError as e:
                 self.log.stop(f"致命错误：{e}")
                 self.ui.error(str(e))
-                return
+                return False
 
             self.ui.end_stream()
             self.context.prompt_tokens = self.llm.last_usage.prompt_tokens
-            self.log.reply(step, reply.text, reply.tool_calls, self.llm.last_usage)
+            self.log.reply(
+                step, reply.text, reply.tool_calls, self.llm.last_usage,
+                reply.finish_reason,
+            )
+            if reply.finish_reason in ("length", "content_filter"):
+                reason = (
+                    "模型输出达到长度上限，截断的内容和工具调用均未执行。"
+                    if reply.finish_reason == "length"
+                    else "模型输出被 provider 的内容过滤器截断，工具调用未执行。"
+                )
+                self.log.stop(reason)
+                self.ui.error(reason)
+                return False
             self.context.add_assistant(reply.text, reply.tool_calls)
             self.ui.set_status(step, self.context.usage_ratio(), self.llm.last_usage)
 
             # 模型不再请求动作，说明它认为这一轮做完了，把控制权还给用户
             if not reply.tool_calls:
                 self.log.stop("自然终止")
-                return
+                return True
 
             if self._execute(reply.tool_calls, stuck):
-                return
+                return False
 
     def _check_stop(self, step: int, started: float) -> Stop | None:
         if step > MAX_STEPS:
@@ -151,6 +181,7 @@ class Agent:
 
     def _execute(self, calls: list[ToolCall], stuck: StuckDetector) -> bool:
         """执行本轮的全部调用。返回 True 表示该终止整个任务。"""
+        nudge_reason = None
         for index, call in enumerate(calls):
             try:
                 ok = self._dispatch(call)
@@ -165,15 +196,23 @@ class Agent:
             if not reason:
                 continue
             if stuck.nudged:
+                self._close_pending(
+                    calls[index + 1 :],
+                    "[未执行] 检测到重复失败，本轮剩余调用已取消。",
+                )
                 self.log.stop(reason)
                 self.ui.notice(f"{reason}，已停止。请调整任务描述后重试。")
                 return True
             stuck.nudged = True
-            self.context.add_system_note(
-                f"{reason}。不要再重复同样的调用，换一种思路，"
+            nudge_reason = reason
+            stuck.forgive(call)
+        if nudge_reason:
+            note = (
+                f"{nudge_reason}。不要再重复同样的调用，换一种思路，"
                 "或者直接告诉用户你卡在哪里。"
             )
-            stuck.forgive(call)
+            self.context.add_system_note(note)
+            self.log.system_note(note)
         return False
 
     def _dispatch(self, call: ToolCall) -> bool:
@@ -185,7 +224,7 @@ class Agent:
         try:
             tool = self.tools.get(call.name)
             args = parse_arguments(call)
-            validate(args, tool.parameters, call.name)
+            args = validate(args, tool.parameters, call.name)
             self.ui.tool_start(call.name, args, tool.primary)
 
             if tool.writes and not self.ui.confirm(call.name, args):
@@ -203,20 +242,25 @@ class Agent:
             # 参数名对不上工具签名
             return self._record(call, "fail", f"错误：参数不匹配（{e}）")
         except Exception as e:  # 兜底：任何工具内部异常都不应让 agent 整个退出
+            self.log.internal_error(call, traceback.format_exc())
             return self._record(call, "fail", f"错误：{type(e).__name__}: {e}")
 
         # 命令退出码非零不算工具失败：模型需要读那段输出才能修问题，
         # 也不该让连续的测试失败触发卡死检测。
         return self._record(call, "warn" if result.startswith(EXIT_PREFIX) else "ok", result)
 
-    def _close_pending(self, calls: list[ToolCall]) -> None:
+    def _close_pending(
+        self,
+        calls: list[ToolCall],
+        content: str = "[已中断] 用户中断了本次任务，这个调用没有执行。",
+    ) -> None:
         """给还没执行的调用补一条结果，让消息组保持闭合。
 
         会话恢复（session.load_session）处理的是同一个不变量的磁盘版本 ——
         那边只能靠丢弃残缺的组来收场，这边还在内存里，可以直接把缺的补齐。
         """
         for call in calls:
-            self._record(call, "fail", "[已中断] 用户中断了本次任务，这个调用没有执行。")
+            self._record(call, "fail", content)
 
     def _record(self, call: ToolCall, status: str, content: str) -> bool:
         self.context.add_tool_result(call, content)

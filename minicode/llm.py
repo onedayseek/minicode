@@ -5,8 +5,11 @@ tool_calls 的累积、终止判断、历史管理都在 parsing / loop / contex
 """
 
 import os
+import random
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from openai import (
@@ -17,7 +20,7 @@ from openai import (
     RateLimitError,
 )
 
-from .errors import FatalError, RetryableError
+from .errors import ContextLimitError, FatalError, ProtocolError, RetryableError
 from .parsing import Reply, ToolCallAccumulator
 
 
@@ -55,7 +58,10 @@ class LLMClient:
                 "未配置 API key。请复制 .env.example 为 .env 并填入 MINICODE_API_KEY。"
             )
         self.model = model
-        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
+        # 重试策略由这一层统一控制，避免 SDK 默认重试再叠加外层四轮重试。
+        self._client = OpenAI(
+            base_url=base_url, api_key=api_key, timeout=120.0, max_retries=0
+        )
         self.last_usage = Usage()
 
     @classmethod
@@ -90,10 +96,17 @@ class LLMClient:
                     raise
                 if on_retry:
                     on_retry(str(e), streamed)
-                time.sleep(delays[attempt])
+                delay = (
+                    e.retry_after
+                    if e.retry_after is not None
+                    else delays[attempt] * random.uniform(0.8, 1.2)
+                )
+                time.sleep(max(0.0, delay))
         raise RetryableError("重试已用尽")  # 不会走到，兜底
 
     def _chat_once(self, messages: list[dict], tools: list[dict], on_text) -> Reply:
+        # provider 没返回 usage 时不能沿用上一轮的旧值。
+        self.last_usage = Usage()
         try:
             stream = self._client.chat.completions.create(
                 model=self.model,
@@ -115,7 +128,10 @@ class LLMClient:
                     )
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    reply.finish_reason = choice.finish_reason
+                delta = choice.delta
                 if delta.content:
                     reply.text += delta.content
                     if on_text:
@@ -124,13 +140,64 @@ class LLMClient:
             reply.tool_calls = acc.finish()
             return reply
 
-        except (APIConnectionError, APITimeoutError, RateLimitError) as e:
+        except RateLimitError as e:
+            raise RetryableError(str(e), _retry_after_seconds(e)) from e
+        except (APIConnectionError, APITimeoutError) as e:
             raise RetryableError(str(e)) from e
         except APIStatusError as e:
-            if e.status_code in (401, 403):
-                raise FatalError(f"认证失败（HTTP {e.status_code}），请检查 API key。") from e
-            if e.status_code == 402:
-                raise FatalError("账户余额不足。") from e
-            if e.status_code >= 500 or e.status_code == 429:
-                raise RetryableError(f"HTTP {e.status_code}") from e
-            raise FatalError(f"请求被拒绝（HTTP {e.status_code}）：{e}") from e
+            raise _classify_status_error(e) from e
+
+
+def _classify_status_error(error) -> Exception:
+    status = error.status_code
+    if status in (401, 403):
+        return FatalError(f"认证失败（HTTP {status}），请检查 API key。")
+    if status == 402:
+        return FatalError("账户余额不足。")
+    if status >= 500 or status in (408, 409, 425, 429):
+        return RetryableError(f"HTTP {status}", _retry_after_seconds(error))
+
+    detail = f"{error} {getattr(error, 'body', '')}"
+    lowered = detail.lower()
+    if status == 400 and any(
+        marker in lowered
+        for marker in (
+            "context length", "context window", "maximum context",
+            "max context", "too many tokens",
+        )
+    ):
+        return ContextLimitError(
+            "请求超过模型上下文窗口。当前历史需要压缩，或用 /clear 开新会话。"
+        )
+    if status == 400 and any(
+        marker in lowered
+        for marker in (
+            "tool_call", "tool call", "role 'tool'", 'role "tool"',
+            "tool message",
+        )
+    ):
+        return ProtocolError(
+            "工具调用消息没有正确配对，会话协议已损坏。请保留日志并用 /clear 重试。"
+        )
+    return FatalError(f"请求被拒绝（HTTP {status}）：{error}")
+
+
+def _retry_after_seconds(error) -> float | None:
+    """解析 Retry-After，兼容秒数和 HTTP-date 两种标准格式。"""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(str(raw))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())

@@ -57,11 +57,23 @@ class NullLog:
 
     def __init__(self) -> None:
         self.stops: list[str] = []
+        self.system_notes: list[str] = []
+        self.elisions: list[dict] = []
+        self.internal_errors: list[str] = []
 
     def user(self, text: str) -> None: ...
     def request(self, *args) -> None: ...
     def reply(self, *args) -> None: ...
     def tool_result(self, call, status: str, content: str) -> None: ...
+
+    def system_note(self, content: str) -> None:
+        self.system_notes.append(content)
+
+    def context_elision(self, notice: str, changes: list[dict]) -> None:
+        self.elisions.append({"notice": notice, "changes": changes})
+
+    def internal_error(self, call, traceback_text: str) -> None:
+        self.internal_errors.append(traceback_text)
 
     def stop(self, reason: str) -> None:
         self.stops.append(reason)
