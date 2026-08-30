@@ -19,6 +19,15 @@ class Tool:
     run: Callable[..., str]
     writes: bool = False  # 是否修改工作区 / 执行命令，用于权限审批
 
+    @property
+    def primary(self) -> str | None:
+        """展示时突出的那个参数，取第一个必填项。
+
+        `edit_file(app.py)` 比 `edit_file(path='app.py')` 好扫 —— 一眼看到
+        动作作用在什么上，参数名本身没有信息量。
+        """
+        return next(iter(self.parameters.get("required", [])), None)
+
     def schema(self) -> dict:
         return {
             "type": "function",

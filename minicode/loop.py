@@ -186,7 +186,7 @@ class Agent:
             tool = self.tools.get(call.name)
             args = parse_arguments(call)
             validate(args, tool.parameters, call.name)
-            self.ui.tool_start(call.name, args)
+            self.ui.tool_start(call.name, args, tool.primary)
 
             if tool.writes and not self.ui.confirm(call.name, args):
                 raise UserAbort("用户拒绝了这次操作")

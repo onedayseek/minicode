@@ -17,6 +17,8 @@ HELP = """\
 /status   查看上下文占用
 /log      显示本次会话记录文件的位置
 /exit     退出
+
+输入时 Alt+Enter 或 Ctrl-J 手动换行，Enter 提交。
 """
 
 

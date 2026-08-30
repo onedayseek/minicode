@@ -47,6 +47,19 @@ def test_空输入():
     assert type_into(ENTER) == ""
 
 
+def test_Ctrl_J_手动换行而不提交():
+    """终端里 Ctrl-J 是 LF、Enter 是 CR，这两个键码能区分开，所以绑得住。"""
+    assert type_into("第一行\x0a第二行" + ENTER) == "第一行\n第二行"
+
+
+def test_Alt_Enter_手动换行():
+    assert type_into("第一行\x1b\r第二行" + ENTER) == "第一行\n第二行"
+
+
+def test_多次换行后一次提交():
+    assert type_into("a\x0ab\x0ac" + ENTER) == "a\nb\nc"
+
+
 def test_Ctrl_D_抛EOF():
     """cli 靠这个退出交互模式。"""
     with pytest.raises(EOFError):
