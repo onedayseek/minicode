@@ -138,3 +138,11 @@ def test_记录最后的token数(tmp_path):
         [START, USER, reply(("A", "bash", "{}"), tokens=111), result("A"), reply(tokens=222)],
     )
     assert load_session(log).prompt_tokens == 222
+
+
+def test_恢复工具状态供历史展示使用(tmp_path):
+    log = write_log(
+        tmp_path,
+        [START, USER, reply(("A", "shell", "{}")), {**result("A", "shell"), "status": "warn"}],
+    )
+    assert load_session(log).tool_statuses == {"A": "warn"}

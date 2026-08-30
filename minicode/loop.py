@@ -189,7 +189,9 @@ class Agent:
             self.ui.tool_start(call.name, args, tool.primary)
 
             if tool.writes and not self.ui.confirm(call.name, args):
-                raise UserAbort("用户拒绝了这次操作")
+                message = getattr(self.ui, "supplemental_message", "").strip()
+                detail = f"。用户补充消息：\n{message}" if message else ""
+                raise UserAbort(f"用户拒绝了这次操作{detail}")
 
             result = tool.run(**args)
 

@@ -14,7 +14,7 @@ dependencies = [
     # 终端渲染
     "rich>=13.0",
     # 终端输入：多行粘贴、输入历史、行内编辑
-    "prompt_toolkit>=3.0",
+    "prompt_toolkit>=3.0.52",
 ]
 
 [project.optional-dependencies]

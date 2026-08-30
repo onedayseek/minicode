@@ -82,6 +82,20 @@ def test_正常执行完历史也是闭合的(agent):
     assert_groups_valid(agent.context.messages)
 
 
+def test_用户补充消息会作为工具结果回灌给模型(agent):
+    rejected = call("R", "shell", '{"command":"Remove-Item generated -Recurse"}')
+    agent.context.add_assistant("准备清理", [rejected])
+    agent.ui.approve = False
+    agent.ui.supplemental_message = "generated 目录需要保留"
+
+    assert not agent._dispatch(rejected)
+
+    result = agent.context.messages[-1]
+    assert result["role"] == "tool"
+    assert "用户补充消息" in result["content"]
+    assert "generated 目录需要保留" in result["content"]
+
+
 # ---- 卡死检测 ----
 
 

@@ -10,17 +10,27 @@
 """
 
 import difflib
+import html as html_lib
+import json
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import CompleteEvent, WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.styles import Style
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markup import escape
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.text import Text
 
 # 工具结果：几行足够判断「做了什么、成没成」
 RESULT_MAX_LINES = 5
@@ -40,10 +50,45 @@ ARG_INLINE_LIMIT = 72
 # 调用摘要行里主参数的显示宽度
 HEADLINE_WIDTH = 64
 
-_PROMPT_STYLE = Style.from_dict({"prompt": "ansigreen bold"})
+ACCENT = "#d97757"
+PRIMARY_MARK = f"[bold {ACCENT}]●[/]"
+SLASH_COMMANDS = ("/help", "/clear", "/status", "/log", "/exit")
+_COMMAND_COMPLETER = WordCompleter(SLASH_COMMANDS, sentence=True)
+_AUTO_SUGGEST = AutoSuggestFromHistory()
+TOOL_LABELS = {
+    "read_file": "Read",
+    "write_file": "Write",
+    "edit_file": "Edit",
+    "list_files": "List",
+    "grep": "Search",
+    "shell": "Run",
+}
+
+_PROMPT_STYLE = Style.from_dict(
+    {
+        "prompt": f"{ACCENT} bold",
+        "supplement": f"{ACCENT} bold",
+        "continuation": "ansibrightblack",
+        "bottom-toolbar": "bg:#242424 #a8a8a8",
+        "status": "bg:#242424 #d7d7d7",
+        "hint": "bg:#242424 #808080",
+        "completion-menu.completion": "bg:#303030 #d7d7d7",
+        "completion-menu.completion.current": "bg:#6f3d2f #ffffff",
+    }
+)
+
+_CHOICE_STYLE = Style.from_dict(
+    {
+        "question": "bold",
+        "selected-option": f"{ACCENT} bold",
+        "number": "#707070",
+        "option": "#b0b0b0",
+        "choice-hint": "#707070",
+    }
+)
 
 
-def _key_bindings() -> KeyBindings:
+def _key_bindings(completer=None, auto_suggest=None) -> KeyBindings:
     """Enter 提交，Alt+Enter / Ctrl-J 手动换行。
 
     没绑 Shift+Enter：绝大多数终端不把它和 Enter 区分开，发出来的是同一个键码，
@@ -56,10 +101,52 @@ def _key_bindings() -> KeyBindings:
     def _(event) -> None:
         event.current_buffer.insert_text("\n")
 
+    @kb.add("tab")
+    def _(event) -> None:
+        """Tab 接受当前建议；没有建议时不把控制字符写进输入框。"""
+        buffer = event.current_buffer
+        candidates = (
+            list(completer.get_completions(
+                buffer.document, CompleteEvent(completion_requested=True)
+            ))
+            if completer is not None
+            else []
+        )
+        if len(candidates) == 1:
+            buffer.apply_completion(candidates[0])
+        elif candidates:
+            buffer.start_completion(select_first=True)
+        else:
+            suggestion = buffer.suggestion
+            if suggestion is None and auto_suggest is not None:
+                suggestion = auto_suggest.get_suggestion(buffer, buffer.document)
+            if suggestion:
+                buffer.insert_text(suggestion.text)
+
     return kb
 
 
-def _make_session(history, ptk_input, ptk_output) -> PromptSession | None:
+def _choice_bindings() -> KeyBindings:
+    """方向键由 RadioList 处理；Esc 是拒绝的快捷出口。"""
+    kb = KeyBindings()
+
+    @kb.add("escape", eager=True)
+    def _(event) -> None:
+        event.app.exit(result="cancel")
+
+    return kb
+
+
+def _make_session(
+    history,
+    ptk_input,
+    ptk_output,
+    bottom_toolbar,
+    *,
+    completer=None,
+    auto_suggest=None,
+    history_search: bool = False,
+) -> PromptSession | None:
     """建输入会话，终端撑不住就返回 None，由调用方降级。
 
     Windows 下 prompt_toolkit 要求一个真正的 console screen buffer。
@@ -70,7 +157,13 @@ def _make_session(history, ptk_input, ptk_output) -> PromptSession | None:
         return PromptSession(
             history=history,
             style=_PROMPT_STYLE,
-            key_bindings=_key_bindings(),
+            key_bindings=_key_bindings(completer, auto_suggest),
+            completer=completer,
+            complete_while_typing=completer is not None,
+            auto_suggest=auto_suggest,
+            enable_history_search=history_search,
+            bottom_toolbar=bottom_toolbar,
+            prompt_continuation=lambda *_: HTML("<continuation>· </continuation>"),
             input=ptk_input,
             output=ptk_output,
         )
@@ -133,6 +226,9 @@ class UI:
         self._always: set[str] = set()
         self._streaming = False
         self._status = None
+        self._ptk_input = ptk_input
+        self._ptk_output = ptk_output
+        self.supplemental_message = ""
         self.status_line = ""
         self.total_in = 0
         self.total_out = 0
@@ -147,7 +243,15 @@ class UI:
                 pass  # 历史记录存不下不该拦住会话
         # 非交互（管道、重定向）时不需要增强输入，省掉一次注定失败的尝试
         self._session = (
-            _make_session(history, ptk_input, ptk_output)
+            _make_session(
+                history,
+                ptk_input,
+                ptk_output,
+                self._bottom_toolbar,
+                completer=_COMMAND_COMPLETER,
+                auto_suggest=_AUTO_SUGGEST,
+                history_search=True,
+            )
             if ptk_input is not None or sys.stdin.isatty()
             else None
         )
@@ -162,7 +266,9 @@ class UI:
     def start_thinking(self) -> None:
         """首个 token 到达前终端是静的，没有提示的话看起来像卡住了。"""
         if self._status is None:
-            self._status = self.console.status("[dim]思考中…[/]", spinner="dots")
+            self._status = self.console.status(
+                f"[bold {ACCENT}]✻[/] [dim]正在思考…[/]", spinner="dots"
+            )
             self._status.start()
 
     def stop_thinking(self) -> None:
@@ -175,7 +281,8 @@ class UI:
     def stream(self, chunk: str) -> None:
         self.stop_thinking()
         if not self._streaming:
-            self.console.print("[bold cyan]●[/] ", end="")
+            self.console.print()
+            self.console.print(f"{PRIMARY_MARK} ", end="")
             self._streaming = True
         self.console.print(escape(chunk), end="", highlight=False)
 
@@ -194,14 +301,20 @@ class UI:
         self.end_stream()
         detail = reason.splitlines()[0][:120] if reason.strip() else "未知原因"
         tail = "，上面这段会重新生成" if partial else ""
-        self.console.print(f"[dim]— 请求中断（{escape(detail)}），正在重试{tail}[/]")
+        self.console.print(
+            f"[yellow]↻[/] [dim]请求中断（{escape(detail)}），正在重试{tail}[/]"
+        )
 
     # ---- 工具调用 ----
 
     def tool_start(self, name: str, args: dict, primary: str | None = None) -> None:
         """摘要一行 + 完整参数。参数不截断 —— 那是批不批准这次操作的依据。"""
         self.stop_thinking()
-        self.console.print(f"[bold yellow]⏺[/] [bold]{name}[/]({escape(_headline(args, primary))})")
+        self.console.print()
+        label = TOOL_LABELS.get(name, name)
+        self.console.print(
+            f"{PRIMARY_MARK} [bold]{label}[/]({escape(_headline(args, primary))})"
+        )
 
         if name == "edit_file" and self._preview_edit(args):
             return
@@ -272,15 +385,85 @@ class UI:
 
     def confirm(self, name: str, args: dict) -> bool:
         self.stop_thinking()
+        self.supplemental_message = ""
         if self.auto_approve or name in self._always:
             return True
-        answer = self.console.input(
-            f"  [bold]允许执行 {name}?[/] [dim](y=允许 / n=拒绝 / a=本会话总是允许)[/] "
-        ).strip().lower()
-        if answer == "a":
+        if self.rich_input:
+            session = (
+                create_app_session(input=self._ptk_input, output=self._ptk_output)
+                if self._ptk_input is not None and self._ptk_output is not None
+                else nullcontext()
+            )
+            with session:
+                answer = choice(
+                    HTML(
+                        f"<question>? 允许执行 {html_lib.escape(name)}？</question>\n"
+                        "<choice-hint>  ↑/↓ 选择 · Enter 确认 · Esc 拒绝</choice-hint>"
+                    ),
+                    options=[
+                        ("once", "允许一次"),
+                        ("always", f"本会话始终允许 {name}"),
+                        ("reject", "拒绝，并补充消息"),
+                    ],
+                    default="once",
+                    symbol="❯",
+                    style=_CHOICE_STYLE,
+                    key_bindings=_choice_bindings(),
+                )
+        else:
+            answer = self._confirm_fallback(name)
+
+        if answer == "always":
             self._always.add(name)
             return True
-        return answer in ("", "y", "yes")
+        if answer == "reject" and self.rich_input:
+            self.supplemental_message = self._ask_supplemental_message()
+        return answer == "once"
+
+    def _ask_supplemental_message(self) -> str:
+        """收集给模型看的补充消息，复用所有用户文本输入的按键与粘贴语义。"""
+        session = (
+            create_app_session(input=self._ptk_input, output=self._ptk_output)
+            if self._ptk_input is not None and self._ptk_output is not None
+            else nullcontext()
+        )
+        try:
+            with session:
+                prompt = _make_session(
+                    InMemoryHistory(),
+                    self._ptk_input,
+                    self._ptk_output,
+                    HTML("<hint> Alt+Enter 换行 · Enter 提交 </hint>"),
+                )
+                if prompt is None:
+                    raise RuntimeError("当前终端无法创建增强输入")
+                return prompt.prompt(
+                    HTML("<supplement>  ❯ </supplement>补充消息（可选）：")
+                ).strip()
+        except (KeyboardInterrupt, EOFError):
+            return ""
+        except Exception:
+            return self.console.input(
+                f"  [bold {ACCENT}]❯[/] 补充消息（可选）："
+            ).strip()
+
+    def _confirm_fallback(self, name: str) -> str:
+        """管道与简陋终端没有方向键 UI，保留数字输入作为降级路径。"""
+        self.console.print(f"  [bold yellow]?[/] [bold]允许执行 {escape(name)}？[/]")
+        self.console.print(f"    [bold {ACCENT}]1[/] 允许一次")
+        self.console.print(f"    [bold {ACCENT}]2[/] 本会话始终允许 {escape(name)}")
+        self.console.print(f"    [bold {ACCENT}]3[/] 拒绝，并补充消息")
+        answer = self.console.input(
+            f"  [dim]请选择[/] [bold {ACCENT}][1][/][dim]：[/] "
+        ).strip().lower()
+        if answer in ("2", "a", "always"):
+            return "always"
+        if answer in ("3", "n", "no"):
+            self.supplemental_message = self.console.input(
+                f"  [bold {ACCENT}]❯[/] 补充消息（可选）："
+            ).strip()
+            return "reject"
+        return "once" if answer in ("", "1", "y", "yes") else "reject"
 
     # ---- 状态与提示 ----
 
@@ -289,7 +472,11 @@ class UI:
         self.total_in += usage.prompt_tokens
         self.total_out += usage.completion_tokens
         self.total_cached += usage.cache_hit_tokens
-        parts = [f"第 {step} 步", f"上下文 {ratio:.0%}", f"{usage.prompt_tokens} tokens"]
+        parts = [
+            f"第 {step} 步",
+            f"上下文 {ratio:.0%}",
+            f"本轮 {usage.prompt_tokens:,} tokens",
+        ]
         if usage.cache_hit_tokens and usage.prompt_tokens:
             parts.append(f"缓存命中 {usage.cache_hit_tokens / usage.prompt_tokens:.0%}")
         self.status_line = " · ".join(parts)
@@ -306,30 +493,81 @@ class UI:
 
     def notice(self, text: str) -> None:
         self.stop_thinking()
-        self.console.print(f"[dim]— {escape(text)}[/]")
+        self.console.print(f"[dim]↳ {escape(text)}[/]")
 
     def error(self, text: str) -> None:
         self.stop_thinking()
-        self.console.print(f"[bold red]错误[/] {escape(text)}")
+        self.console.print(f"[bold red]× 错误[/] {escape(text)}")
 
     def banner(self, model: str, root, mode: str, log_path, shell=None) -> None:
-        self.console.print(f"\n[bold]minicode[/] [dim]·[/] {model} [dim]·[/] {mode}")
-        self.console.print(f"[dim]  工作目录 {root}[/]")
+        lines = [
+            Text.assemble(("✻ ", f"bold {ACCENT}"), ("minicode", "bold")),
+            Text(""),
+            _meta_line("model", model),
+            _meta_line("directory", str(root)),
+            _meta_line("approval", mode),
+        ]
         if shell is not None:
-            self.console.print(f"[dim]  命令解释器 {shell.executable}[/]")
+            lines.append(_meta_line("shell", shell.executable))
             if os.environ.get("MSYSTEM") and shell.kind in ("pwsh", "powershell", "cmd"):
                 # 从 Git Bash 启动却拿到 PowerShell 会让人以为是 bug，
                 # 实际是 Windows 上的 Python 一律走 Windows 解释器
-                self.console.print(
-                    "[dim]  （当前在 MSYS / Git Bash，但命令走 Windows 解释器；"
-                    "要用 bash 语法请设 MINICODE_SHELL=bash）[/]"
+                lines.append(
+                    Text(
+                        "Git Bash 中仍使用 Windows shell；可设 MINICODE_SHELL=bash",
+                        style="yellow",
+                    )
                 )
-        self.console.print(f"[dim]  会话记录 {log_path}[/]")
+        self.console.print()
+        self.console.print(
+            Panel(Group(*lines), border_style="#6f554d", padding=(0, 1))
+        )
         if not self.rich_input:
             # 说清楚少了什么，否则用户只会发现「粘贴多行怎么变成好几条命令了」
-            self.console.print("[dim]  当前终端不支持增强输入，多行粘贴与输入历史不可用[/]")
+            self.console.print(
+                "[yellow]![/] [dim]当前终端不支持增强输入，多行粘贴与输入历史不可用[/]"
+            )
         self.console.print(
-            "[dim]  /help 查看命令 · Alt+Enter 换行 · Ctrl-C 中断 · Ctrl-D 退出[/]\n"
+            "[dim]/help 命令 · Tab 接受建议 · Alt+Enter 换行 · Ctrl-C 中断 · Ctrl-D 退出[/]"
+        )
+
+    def show_history(self, messages: list[dict], tool_statuses: dict[str, str]) -> None:
+        """重放恢复出的对话，仅渲染，不执行工具也不修改上下文。"""
+        self.console.print()
+        self.console.print(Rule("已恢复的对话", style="#6f554d"))
+        pending: dict[str, dict] = {}
+
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content") or ""
+            if role == "user":
+                self.console.print()
+                self.console.print(f"[bold {ACCENT}]❯[/] {escape(content)}", highlight=False)
+            elif role == "assistant":
+                if content:
+                    self.console.print()
+                    self.console.print(f"{PRIMARY_MARK} {escape(content)}", highlight=False)
+                for call in message.get("tool_calls") or []:
+                    pending[call.get("id", "")] = call
+            elif role == "tool":
+                call_id = message.get("tool_call_id", "")
+                call = pending.pop(call_id, {})
+                function = call.get("function") or {}
+                name = message.get("name") or function.get("name") or "tool"
+                args = _display_arguments(function.get("arguments", ""))
+                self.tool_start(name, args, next(iter(args), None))
+                status = tool_statuses.get(call_id, "ok")
+                self.tool_end(name, status if status in ("ok", "warn", "fail") else "ok", content)
+
+        self.console.print()
+        self.console.print(Rule("继续会话", style="bright_black"))
+
+    def _bottom_toolbar(self):
+        """增强输入的常驻状态栏；放在输入区里，不向对话记录反复刷状态行。"""
+        status = html_lib.escape(self.status_line or "就绪")
+        return HTML(
+            f"<status> {status} </status>"
+            "<hint>  Tab 接受建议 · / 命令 · Alt+Enter 换行 </hint>"
         )
 
     def prompt(self) -> str:
@@ -340,16 +578,22 @@ class UI:
         不可用时退回逐行读取，功能少但不影响使用。
         """
         self.stop_thinking()
-        if self.status_line:
+        self.console.print()
+        if self.status_line and self._session is None:
             self.console.print(f"[dim]{self.status_line}[/]")
         if self._session is not None:
             try:
-                return self._session.prompt(HTML("<prompt>› </prompt>"))
+                return self._session.prompt(HTML("<prompt>❯ </prompt>"))
             except (KeyboardInterrupt, EOFError):
                 raise  # 中断和 EOF 是正常信号，不是终端不兼容
             except Exception:
                 self._session = None  # 这个终端用不了，之后别再试
-        return self.console.input("[bold green]›[/] ")
+        return self.console.input(f"[bold {ACCENT}]❯[/] ")
+
+
+def _meta_line(label: str, value) -> Text:
+    """启动面板中的等宽元信息行。"""
+    return Text.assemble((f"{label:<10}", "dim"), (str(value), ""))
 
 
 def _headline(args: dict, primary: str | None) -> str:
@@ -361,3 +605,14 @@ def _headline(args: dict, primary: str | None) -> str:
         f"{k}={v!r}" for k, v in args.items() if k != primary and _is_inline(v)
     ]
     return ", ".join(parts)
+
+
+def _display_arguments(raw) -> dict:
+    """恢复展示里的参数解析失败时保留原文，而不是隐藏那次调用。"""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {"arguments": str(raw)}
+    return parsed if isinstance(parsed, dict) else {"arguments": parsed}

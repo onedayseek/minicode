@@ -18,7 +18,7 @@ HELP = """\
 /log      显示本次会话记录文件的位置
 /exit     退出
 
-输入时 Alt+Enter 或 Ctrl-J 手动换行，Enter 提交。
+输入时 Tab 接受灰色建议，Alt+Enter 或 Ctrl-J 手动换行，Enter 提交。
 """
 
 
@@ -115,16 +115,18 @@ def main(argv: list[str] | None = None) -> int:
         agent.context.messages.extend(restored.messages)
         agent.context.prompt_tokens = restored.prompt_tokens
         agent.seen_files.update(restored.seen_files)
-        ui.notice(
-            f"已从 {resume_path.name} 恢复会话"
-            f"（历史 {len(restored.messages)} 条消息，{len(restored.seen_files)} 个已读文件）"
-        )
 
     if args.prompt:
         agent.run(args.prompt)
         return 0
 
     ui.banner(llm.model, root, "自动批准" if args.yes else "写操作需确认", log.path, agent.shell)
+    if restored is not None:
+        ui.notice(
+            f"已从 {resume_path.name} 恢复会话"
+            f"（历史 {len(restored.messages)} 条消息，{len(restored.seen_files)} 个已读文件）"
+        )
+        ui.show_history(restored.messages, restored.tool_statuses)
     while True:
         try:
             line = ui.prompt().strip()

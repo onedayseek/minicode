@@ -36,8 +36,8 @@ def test_交互模式能启动并退出(tmp_path):
     """banner 在 -p 模式下不会被调用，只有交互模式才走这条路。"""
     r = run_cli("-C", str(tmp_path), stdin="/exit\n")
     assert r.returncode == 0, r.stderr
-    assert "minicode ·" in r.stdout
-    assert "命令解释器" in r.stdout  # 解析到的解释器要显示出来
+    assert "✻ minicode" in r.stdout
+    assert "shell" in r.stdout  # 解析到的解释器要显示出来
 
 
 def test_斜杠命令都不崩(tmp_path):
@@ -92,6 +92,9 @@ def test_从会话恢复(tmp_path):
     r = run_cli("-C", str(tmp_path), "--resume", "old.jsonl", stdin="/exit\n")
     assert r.returncode == 0, r.stderr
     assert "恢复会话" in r.stdout
+    assert "第一轮问题" in r.stdout
+    assert "第一轮回答" in r.stdout
+    assert "继续会话" in r.stdout
 
     # 新记录自成完整历史，原记录不动
     files = sorted(p.name for p in sessions.glob("*.jsonl"))

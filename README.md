@@ -30,7 +30,9 @@ minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
 
 每次运行的会话记录写在 `工作目录/.minicode/sessions/*.jsonl`（一行一个事件，模型实际看到和产生的内容）。`--resume` 从这份记录重建对话上下文继续工作，Ctrl-C 中断或换电脑都能接着上次的进度；恢复后写新会话文件，不覆盖原记录。
 
-交互模式下可用 `/help` `/clear` `/status` `/log` `/exit`。
+交互模式下可用 `/help` `/clear` `/status` `/log` `/exit`；输入 `/` 会显示命令补全，
+灰色的历史建议可按 Tab 接受，Alt+Enter 或 Ctrl-J 可在同一条消息中手动换行。
+写操作审批使用方向键选择、Enter 确认，Esc 可直接拒绝。
 
 ## 测试
 

@@ -47,6 +47,22 @@ def test_空输入():
     assert type_into(ENTER) == ""
 
 
+def test_斜杠命令可用Tab补全():
+    assert type_into("/he\t" + ENTER) == "/help"
+
+
+def test_Tab接受输入历史建议():
+    with create_pipe_input() as pipe:
+        ui = UI(ptk_input=pipe, ptk_output=DummyOutput())
+        ui._session.history.append_string("给 utils.py 补测试")
+        pipe.send_text("给 u\t" + ENTER)
+        assert ui.prompt() == "给 utils.py 补测试"
+
+
+def test_没有补全时Tab不插入控制字符():
+    assert type_into("hello\tworld" + ENTER) == "helloworld"
+
+
 def test_Ctrl_J_手动换行而不提交():
     """终端里 Ctrl-J 是 LF、Enter 是 CR，这两个键码能区分开，所以绑得住。"""
     assert type_into("第一行\x0a第二行" + ENTER) == "第一行\n第二行"

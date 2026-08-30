@@ -23,6 +23,7 @@ class Restored:
     messages: list[dict] = field(default_factory=list)
     prompt_tokens: int = 0
     seen_files: set[str] = field(default_factory=set)
+    tool_statuses: dict[str, str] = field(default_factory=dict)
 
 
 class SessionLog:
@@ -120,6 +121,7 @@ def load_session(path: Path) -> "Restored":
     messages: list[dict] = []
     prompt_tokens = 0
     read_paths: list[str] = []
+    tool_statuses: dict[str, str] = {}
     # 每组：[assistant 消息下标, 尚未闭合的 call id, 本组 tool 消息的下标]
     groups: list[list] = []
     drop: set[int] = set()
@@ -127,6 +129,7 @@ def load_session(path: Path) -> "Restored":
     def reset() -> None:
         messages.clear()
         read_paths.clear()
+        tool_statuses.clear()
         groups.clear()
         drop.clear()
 
@@ -157,6 +160,9 @@ def load_session(path: Path) -> "Restored":
             messages.append(msg)
 
         elif kind == "tool_result":
+            call_id = ev.get("id")
+            if isinstance(call_id, str):
+                tool_statuses[call_id] = ev.get("status", "ok")
             index = len(messages)
             messages.append(
                 {
@@ -192,6 +198,7 @@ def load_session(path: Path) -> "Restored":
         messages=[m for i, m in enumerate(messages) if i not in drop],
         prompt_tokens=prompt_tokens,
         seen_files={str((base / p).resolve()) for p in read_paths},
+        tool_statuses=tool_statuses,
     )
 
 
