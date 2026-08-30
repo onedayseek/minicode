@@ -67,6 +67,25 @@ def test_串联语法按解释器给(kind, expected):
     assert Shell(kind, "x").chain == expected
 
 
+@pytest.mark.parametrize("bad", [0, -1])
+def test_非正的timeout在起进程之前就被拒绝(tmp_path, monkeypatch, bad):
+    """不拦的话它会原样传给 communicate：进程照起，然后立刻被判超时，
+    报错还写着「超过 0 秒未结束」—— 模型照着这条只会去加大 timeout，方向是错的。
+    """
+    started = []
+    real = subprocess.Popen.__init__
+
+    def spy(self, *args, **kwargs):
+        started.append(args)
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", spy)
+
+    with pytest.raises(ToolError, match="必须是大于 0"):
+        run_tool(tmp_path)("echo hi", timeout=bad)
+    assert not started
+
+
 def test_超时上限真的生效(tmp_path, monkeypatch):
     """描述里承诺的 300 秒上限，要和实际传给 communicate 的值一致。"""
     seen = {}

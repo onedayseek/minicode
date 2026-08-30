@@ -156,6 +156,11 @@ class Agent:
                     if reply.finish_reason == "length"
                     else "模型输出被 provider 的内容过滤器截断，工具调用未执行。"
                 )
+                # 已经流到屏幕上的那段文本照常进历史，只是不带 tool_calls。
+                # 丢掉它会让同一段回复在两条路径上不一致：本进程的下一轮追问
+                # 看不到，而从日志 --resume 重建时它又回来了。
+                if reply.text:
+                    self.context.add_assistant(reply.text, [])
                 self.log.stop(reason)
                 self.ui.error(reason)
                 return False

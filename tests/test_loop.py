@@ -162,6 +162,27 @@ def test_长度截断的工具调用不会执行(agent):
     assert not any(m["role"] == "tool" for m in agent.context.messages)
 
 
+def test_长度截断仍然保留已经说出口的那段话(agent):
+    """被截断的是工具调用，不是那段文本 —— 它已经流到用户屏幕上了。
+
+    丢掉它会让同一段回复在两条路径上不一致：本进程的下一轮追问看不到，
+    而从会话记录 --resume 重建时它又回来了。
+    """
+    agent.llm = ScriptedLLM([
+        Reply(
+            text="我准备分三步来做，第一步是",
+            tool_calls=[call("A", "write_file", '{"path":"x.py","content":"half')],
+            finish_reason="length",
+        )
+    ])
+
+    assert agent.run("写文件") is False
+    assistant = [m for m in agent.context.messages if m["role"] == "assistant"]
+    assert [m["content"] for m in assistant] == ["我准备分三步来做，第一步是"]
+    assert "tool_calls" not in assistant[0]
+    assert_groups_valid(agent.context.messages)
+
+
 def test_工具内部异常的traceback写入日志(agent):
     tool = agent.tools.get("read_file")
     tool.run = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("内部坏了"))

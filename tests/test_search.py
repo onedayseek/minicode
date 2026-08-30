@@ -58,6 +58,21 @@ def test_窄include也受扫描上限约束(tmp_path, monkeypatch):
     assert "没有匹配" in out and "已扫描 5 个文件后停止" in out
 
 
+def test_命中过多时仍然说明扫描不完整(tmp_path, monkeypatch):
+    """两层截断是两回事：命中截断说的是「后面还有」，扫描截断说的是
+    「有些文件压根没看过」。只报前者，会让人以为覆盖是完整的。
+    """
+    monkeypatch.setattr(search, "MAX_SCAN_FILES", 6)
+    monkeypatch.setattr(search, "MAX_HITS", 3)
+    run = tools_at(tmp_path)
+    for i in range(20):
+        (tmp_path / f"f{i}.txt").write_text("target_symbol\n" * 5, encoding="utf-8")
+
+    out = run["grep"]("target_symbol")
+    assert "命中过多" in out
+    assert "已扫描 6 个文件后停止" in out
+
+
 def test_非UTF8文件也能搜到(tmp_path):
     run = tools_at(tmp_path)
     (tmp_path / "gbk.txt").write_bytes("中文内容".encode("gbk"))

@@ -109,7 +109,13 @@ def make_tools(root: Path) -> list[Tool]:
                     rel = file.relative_to(root)
                     results.append(f"{rel}:{lineno}:{line.strip()[:200]}")
                     if len(results) >= MAX_HITS:
-                        return "\n".join(results) + f"\n... 命中过多，已截断至 {MAX_HITS} 条"
+                        return (
+                            "\n".join(results)
+                            + f"\n... 命中过多，已截断至 {MAX_HITS} 条"
+                            # 扫描本身也可能没走完。只说「命中过多」会让人以为
+                            # 剩下的都在后面，实际是有一部分文件压根没看过。
+                            + truncated
+                        )
         if not results:
             return f"没有匹配 `{pattern}` 的内容。{truncated}"
         return "\n".join(results) + truncated

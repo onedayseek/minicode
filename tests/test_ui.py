@@ -1,11 +1,34 @@
 """终端呈现中影响判断和审批的关键信息。"""
 
+import io
+import re
 from types import SimpleNamespace
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from rich.console import Console
+from rich.segment import Segment
+from rich.style import Style
 import minicode.ui as ui_module
 from minicode.ui import UI
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible(output: str) -> list[str]:
+    """按用户实际看到的样子拆行。
+
+    断言只针对可见字符：颜色码怎么切分、间距落在哪个 style 段里，是 rich 的
+    实现细节，各版本不一样，绑上去的测试红了也说明不了 UI 坏没坏。
+    """
+    return _ANSI.sub("", output).split("\n")
+
+
+def body_column(line: str) -> int:
+    """`● 正文` 这类行里，正文从第几个可见列开始。"""
+    index = line.index("●")
+    rest = line[index + 1 :]
+    return index + 1 + (len(rest) - len(rest.lstrip(" ")))
 
 
 def test_工具摘要使用动作名并突出主参数(capsys):
@@ -37,6 +60,54 @@ def test_模型回复和所有工具调用共用同一个主事件标记(capsys)
     ui.tool_start("shell", {"command": "pytest"}, "command")
 
     assert capsys.readouterr().out.count("●") == 3
+
+
+def test_模型回复与工具调用的正文起始列相同(capsys):
+    """标记后的间距由 ui 自己给出，不靠 Table 的 padding 推导出来。
+
+    推导的结果跟 rich 版本有关：同一份代码在 13.x 下多空一格、在 14/15 下不多，
+    错位只在部分环境里出现。这个断言把「两种行必须对齐」这件事本身钉住。
+    """
+    ui = UI()
+    ui.stream("回复正文")
+    ui.end_stream()
+    ui.tool_start("read_file", {"path": "app.py"}, "path")
+
+    marked = [line for line in visible(capsys.readouterr().out) if "●" in line]
+    assert len(marked) == 2
+    assert body_column(marked[0]) == body_column(marked[1])
+
+
+def test_模型回复不带行尾空格(capsys):
+    """rich 把 Markdown 段落填充到可用宽度，那些空格复制出去都在。"""
+    ui = UI()
+    ui.stream("回复正文")
+    ui.end_stream()
+
+    for line in visible(capsys.readouterr().out):
+        assert line == line.rstrip(" "), f"行尾有多余空格：{line!r}"
+
+
+def test_剥行尾空格不会削掉代码块的背景():
+    """只剥无样式填充；带背景色的代码块空格属于内容的一部分。"""
+    plain = Segment("正文" + " " * 20)
+    code = Segment("  print(1)      ", Style(bgcolor="blue"))
+
+    assert ui_module._trim_line_padding([plain]) == [Segment("正文")]
+    assert ui_module._trim_line_padding([code]) == [code]
+
+
+def test_模型回复仍走Console原生输出管线():
+    """直接 file.write 会绕过 record、旧 Windows renderer 和安全写出逻辑。"""
+    output = io.StringIO()
+    ui = UI()
+    ui.console = Console(file=output, record=True, width=60)
+
+    ui.stream("回复正文")
+    ui.end_stream()
+
+    assert "回复正文" in output.getvalue()
+    assert "回复正文" in ui.console.export_text()
 
 
 def test_模型回复支持Markdown渲染(capsys):
@@ -189,8 +260,10 @@ def test_工具块与最终回复之间固定留一行(capsys):
     ui.stream("任务完成")
     ui.end_stream()
 
-    output = capsys.readouterr().out
-    assert "⎿ 读取完成\n\n● 任务完成" in output
+    lines = visible(capsys.readouterr().out)
+    result = next(i for i, line in enumerate(lines) if "⎿ 读取完成" in line)
+    reply = next(i for i, line in enumerate(lines) if "任务完成" in line)
+    assert [line.strip() for line in lines[result + 1 : reply]] == [""]
 
 
 def test_输入提示与上方内容固定留一行(monkeypatch):
@@ -249,6 +322,8 @@ def test_恢复历史会显示用户模型和工具轨迹(capsys):
     ui.show_history(messages, {"A": "ok"})
 
     output = capsys.readouterr().out
-    for expected in ("已恢复的对话", "❯ 先检查项目", "● 我先读取 入口。", "Read(app.py)", "⎿ 读取完成", "继续会话"):
+    for expected in ("已恢复的对话", "❯ 先检查项目", "Read(app.py)", "⎿ 读取完成", "继续会话"):
         assert expected in output
     assert "**" not in output
+    # 模型回复带主事件标记，但不断言标记后空了几格 —— 那是 rich 的实现细节
+    assert any("●" in line and "我先读取 入口。" in line for line in visible(output))

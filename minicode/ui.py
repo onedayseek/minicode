@@ -32,6 +32,7 @@ from rich.markup import escape
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
@@ -51,7 +52,12 @@ HEADLINE_WIDTH = 64
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
 ACCENT = "#d97757"
-PRIMARY_MARK = f"[bold {ACCENT}]●[/]"
+# 主事件标记。模型回复和工具调用行共用它，正文因此从同一列开始。
+# 间距是这里的数据，不交给 Table 的 padding 去推导 —— 固定列宽下 padding
+# 的取值各版本不一致，同一份代码会时而对齐、时而错开一格。
+MARK = "●"
+MARK_GAP = " "
+PRIMARY_MARK = f"[bold {ACCENT}]{MARK}[/]{MARK_GAP}"
 SLASH_COMMANDS = ("/help", "/clear", "/status", "/log", "/exit")
 _COMMAND_COMPLETER = WordCompleter(SLASH_COMMANDS, sentence=True)
 _AUTO_SUGGEST = AutoSuggestFromHistory()
@@ -304,14 +310,18 @@ class UI:
             self._stream_text = ""
             self._stream_marker_pending = True
 
+    def _print_response(self, renderable) -> None:
+        """打印模型回复，并在 Segment 层去掉无样式的行尾填充。"""
+        self.console.print(_TrimTrailingPadding(renderable))
+
     def _print_stream_block(self, text: str) -> None:
         """稳定块只追加一次；已打印内容永不参与后续刷新。"""
         marker = self._stream_marker_pending
         try:
-            self.console.print(_safe_markdown_response(text.rstrip(), marker=marker))
+            self._print_response(_safe_markdown_response(text.rstrip(), marker=marker))
         except Exception:
             try:
-                self.console.print(_plain_response(text.rstrip(), marker=marker))
+                self._print_response(_plain_response(text.rstrip(), marker=marker))
             except Exception:
                 pass  # UI 失败不能终止 agent，会话日志仍保留完整回复
         self._stream_marker_pending = False
@@ -337,7 +347,7 @@ class UI:
         self.console.print()
         label = TOOL_LABELS.get(name, name)
         self.console.print(
-            f"{PRIMARY_MARK} [bold]{label}[/]({escape(_headline(args, primary))})"
+            f"{PRIMARY_MARK}[bold]{label}[/]({escape(_headline(args, primary))})"
         )
 
         if name == "edit_file" and self._preview_edit(args):
@@ -571,9 +581,9 @@ class UI:
                 if content:
                     self.console.print()
                     try:
-                        self.console.print(_safe_markdown_response(content))
+                        self._print_response(_safe_markdown_response(content))
                     except Exception:
-                        self.console.print(_plain_response(content))
+                        self._print_response(_plain_response(content))
                 for call in message.get("tool_calls") or []:
                     pending[call.get("id", "")] = call
             elif role == "tool":
@@ -645,28 +655,75 @@ def _display_arguments(raw) -> dict:
     return parsed if isinstance(parsed, dict) else {"arguments": parsed}
 
 
+def _trim_line_padding(line: list[Segment]) -> list[Segment]:
+    """去掉一行末尾无样式的空格，保留代码块等带背景色的填充。"""
+    line = list(line)
+    while line:
+        segment = line[-1]
+        if segment.control or segment.style:
+            break
+        text = segment.text.rstrip(" ")
+        if text == segment.text:
+            break
+        if text:
+            line[-1] = Segment(text, segment.style, segment.control)
+            break
+        line.pop()
+    return line
+
+
+class _TrimTrailingPadding:
+    """过滤 renderable 的行尾填充，同时保留 Rich 的原生输出管线。"""
+
+    def __init__(self, renderable) -> None:
+        self.renderable = renderable
+
+    def __rich_console__(self, console, options):
+        line: list[Segment] = []
+        for segment in console.render(self.renderable, options):
+            if segment.control or "\n" not in segment.text:
+                line.append(segment)
+                continue
+
+            text = segment.text
+            while True:
+                part, newline, text = text.partition("\n")
+                if part:
+                    line.append(Segment(part, segment.style, segment.control))
+                if not newline:
+                    break
+                yield from _trim_line_padding(line)
+                yield Segment.line()
+                line = []
+                if not text:
+                    break
+
+        yield from _trim_line_padding(line)
+
+
+def _response_grid(marker: bool, body) -> Table:
+    """模型回复的两列布局：标记列 + 正文列。
+
+    列宽和间距都由 MARK / MARK_GAP 给定，Table 只负责把正文挂在右边。
+    不开 expand：撑满终端宽度只会给每一行补一串行尾空格，复制出去还得手动清。
+    """
+    table = Table.grid(padding=0, expand=False)
+    table.add_column(width=len(MARK + MARK_GAP), no_wrap=True)
+    table.add_column()
+    # 续块不重复打标记，但空出同样的宽度，正文仍与首块对齐
+    head = MARK + MARK_GAP if marker else " " * len(MARK + MARK_GAP)
+    table.add_row(Text(head, style=f"bold {ACCENT}"), body)
+    return table
+
+
 def _markdown_response(text: str, marker: bool = True) -> Table:
     """模型回复的统一视图：固定事件标记 + Rich Markdown 正文。"""
-    table = Table.grid(padding=(0, 1), expand=True)
-    table.add_column(width=1, no_wrap=True)
-    table.add_column(ratio=1)
-    table.add_row(
-        Text("●", style=f"bold {ACCENT}") if marker else Text(""),
-        Markdown(text, code_theme="monokai", hyperlinks=True),
-    )
-    return table
+    return _response_grid(marker, Markdown(text, code_theme="monokai", hyperlinks=True))
 
 
 def _plain_response(text: str, marker: bool = True) -> Table:
     """Markdown 解析或渲染失败时保留完整内容。"""
-    table = Table.grid(padding=(0, 1), expand=True)
-    table.add_column(width=1, no_wrap=True)
-    table.add_column(ratio=1)
-    table.add_row(
-        Text("●", style=f"bold {ACCENT}") if marker else Text(""),
-        Text(text),
-    )
-    return table
+    return _response_grid(marker, Text(text))
 
 
 def _safe_markdown_response(text: str, marker: bool = True) -> Table:

@@ -190,6 +190,8 @@ def make_tools(root: Path, shell: Shell) -> list[Tool]:
     patterns = blocked_patterns(shell)
 
     def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+        if timeout < 1:
+            raise ToolError("timeout 必须是大于 0 的整数（秒）。")
         for pattern, why in patterns:
             if pattern.search(command):
                 raise ToolError(f"命令被拦截（{why}）。如果确有必要，请让用户手动执行。")
