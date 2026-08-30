@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .minicode/
 .pytest_cache/
+*.egg-info/
+build/
+dist/

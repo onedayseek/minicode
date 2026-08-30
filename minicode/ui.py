@@ -1,17 +1,51 @@
 """终端渲染与用户交互。
 
 显示原则：输入完整、输出折中。模型写的命令和参数要能看全 —— 那是判断它意图
-是否正确的依据；工具输出则保留首尾、折叠中段，因为关键信息通常在开头
-（命令、配置）和结尾（错误摘要、结论）。
+是否正确、要不要批准这次操作的依据；工具输出只留少量首尾，因为关键信息通常在
+开头（命令、配置）和结尾（错误摘要、结论），中间是过程噪声，完整内容在会话记录里。
+
+输出走 rich，输入走 prompt_toolkit。分工的原因是终端输入远比看上去复杂：
+粘贴的多行文本必须整体作为一次输入（否则会被逐行当成独立命令执行），
+这要处理 bracketed paste 转义序列，而各平台的原始输入接口并不一致。
 """
 
+from pathlib import Path
+import sys
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
 
-# 工具输出显示的行数上限，超出则折叠中段
-RESULT_MAX_LINES = 24
-RESULT_HEAD = 16
-RESULT_TAIL = 6
+_PROMPT_STYLE = Style.from_dict({"prompt": "ansigreen bold"})
+
+
+def _make_session(history, ptk_input, ptk_output) -> PromptSession | None:
+    """建输入会话，终端撑不住就返回 None，由调用方降级。
+
+    Windows 下 prompt_toolkit 要求一个真正的 console screen buffer。
+    Git Bash / MSYS 的伪终端把 TERM 报成 xterm 却没有那个 buffer，
+    创建时直接抛异常 —— 不兜住的话，在 Git Bash 里连启动都做不到。
+    """
+    try:
+        return PromptSession(
+            history=history, style=_PROMPT_STYLE, input=ptk_input, output=ptk_output
+        )
+    except Exception:
+        return None
+
+# 工具结果：几行足够判断「做了什么、成没成」
+RESULT_MAX_LINES = 6
+RESULT_HEAD = 4
+RESULT_TAIL = 2
+# 编辑的 diff 给得宽些：改动行本身就是要看的东西，砍掉就没意义了
+DIFF_MAX_LINES = 12
+# 调用参数：给得宽，模型写的命令和文件内容是审批的依据
+ARG_MAX_LINES = 24
+ARG_HEAD = 16
+ARG_TAIL = 6
 # 单行过长时的截断宽度
 LINE_WIDTH = 200
 # 参数值超过这个长度就换行独立显示，而不是挤在一行里
@@ -32,23 +66,78 @@ def clip(text: str, max_lines: int, head: int, tail: int) -> str:
     )
 
 
+def _diff_style(line: str) -> str:
+    """给 unified diff 的行上色。"""
+    if line.startswith("+"):
+        return "green"
+    if line.startswith("-"):
+        return "red"
+    if line.startswith("@@"):
+        return "cyan"
+    return "dim"
+
+
 class UI:
-    def __init__(self, auto_approve: bool = False) -> None:
+    def __init__(
+        self,
+        auto_approve: bool = False,
+        history_path: Path | None = None,
+        ptk_input=None,
+        ptk_output=None,
+    ) -> None:
         self.console = Console()
         self.auto_approve = auto_approve
         self._always: set[str] = set()
         self._streaming = False
+        self._status = None
         self.status_line = ""
+        self.total_in = 0
+        self.total_out = 0
+        self.total_cached = 0
+
+        history = InMemoryHistory()
+        if history_path is not None:
+            try:
+                history_path.parent.mkdir(parents=True, exist_ok=True)
+                history = FileHistory(str(history_path))
+            except OSError:
+                pass  # 历史记录存不下不该拦住会话
+        # 非交互（管道、重定向）时不需要增强输入，省掉一次注定失败的尝试
+        self._session = (
+            _make_session(history, ptk_input, ptk_output)
+            if ptk_input is not None or sys.stdin.isatty()
+            else None
+        )
+
+    @property
+    def rich_input(self) -> bool:
+        """增强输入是否可用。不可用时没有多行粘贴和输入历史。"""
+        return self._session is not None
+
+    # ---- 等待提示 ----
+
+    def start_thinking(self) -> None:
+        """首个 token 到达前终端是静的，没有提示的话看起来像卡住了。"""
+        if self._status is None:
+            self._status = self.console.status("[dim]思考中…[/]", spinner="dots")
+            self._status.start()
+
+    def stop_thinking(self) -> None:
+        if self._status is not None:
+            self._status.stop()
+            self._status = None
 
     # ---- 模型输出 ----
 
     def stream(self, chunk: str) -> None:
+        self.stop_thinking()
         if not self._streaming:
             self.console.print("[bold cyan]●[/] ", end="")
             self._streaming = True
         self.console.print(escape(chunk), end="", highlight=False)
 
     def end_stream(self) -> None:
+        self.stop_thinking()
         if self._streaming:
             self.console.print()
             self._streaming = False
@@ -67,7 +156,8 @@ class UI:
     # ---- 工具调用 ----
 
     def tool_start(self, name: str, args: dict) -> None:
-        """参数完整显示。命令、文件内容这类长参数换行展开，不截断。"""
+        """参数完整显示。命令、文件内容这类长参数换行展开。"""
+        self.stop_thinking()
         short = {k: v for k, v in args.items() if _is_inline(v)}
         long = {k: v for k, v in args.items() if not _is_inline(v)}
 
@@ -76,24 +166,53 @@ class UI:
         for key, value in long.items():
             text = value if isinstance(value, str) else str(value)
             self.console.print(f"[dim]  │ {key}:[/]")
-            for line in clip(text, RESULT_MAX_LINES, RESULT_HEAD, RESULT_TAIL).splitlines():
+            for line in clip(text, ARG_MAX_LINES, ARG_HEAD, ARG_TAIL).splitlines():
                 self.console.print(f"[dim]  │[/] {escape(line)}")
 
-    def tool_end(self, status: str, detail: str) -> None:
+    def tool_end(self, name: str, status: str, detail: str) -> None:
         """status: ok / warn / fail。warn 表示工具跑完了但结果不理想（如退出码非零）。"""
+        self.stop_thinking()
         mark = {"ok": "[green]✓[/]", "warn": "[yellow]▲[/]", "fail": "[red]✗[/]"}[status]
         color = {"ok": "dim", "warn": "yellow", "fail": "red"}[status]
-        total = len(detail.splitlines())
-        shown = clip(detail.rstrip(), RESULT_MAX_LINES, RESULT_HEAD, RESULT_TAIL)
 
-        lines = shown.splitlines() or [""]
+        if status == "ok" and name == "edit_file":
+            self._render_edit(mark, detail)
+            return
+
+        total = len(detail.splitlines())
+        lines = clip(detail.rstrip(), RESULT_MAX_LINES, RESULT_HEAD, RESULT_TAIL).splitlines() or [""]
         self.console.print(f"  {mark} [{color}]{escape(lines[0])}[/]")
         for line in lines[1:]:
             self.console.print(f"    [{color}]{escape(line)}[/]")
         if total > RESULT_MAX_LINES:
             self.console.print(f"    [dim]（共 {total} 行）[/]")
 
+    def _render_edit(self, mark: str, detail: str) -> None:
+        """编辑结果：首行是摘要，其余是 diff。
+
+        diff 的折叠规则和普通输出不同 —— 改动行是全部价值所在，上下文行只用于定位。
+        套用「留头留尾、砍中段」会把 `-` 行留下而砍掉 `+` 行，
+        正好丢掉「改成了什么」这个唯一要看的信息。所以超长时先丢上下文行。
+        """
+        head, _, body = detail.partition("\n")
+        self.console.print(f"  {mark} [dim]{escape(head)}[/]")
+
+        lines = [l for l in body.splitlines() if not l.startswith("@@")]
+        dropped = 0
+        if len(lines) > DIFF_MAX_LINES:
+            changed = [l for l in lines if l[:1] in "+-"]
+            dropped, lines = len(lines) - len(changed), changed
+        for line in lines[:DIFF_MAX_LINES]:
+            self.console.print(f"    [{_diff_style(line)}]{escape(line)}[/]")
+
+        rest = len(lines) - DIFF_MAX_LINES
+        if rest > 0:
+            self.console.print(f"    [dim]… 还有 {rest} 行改动[/]")
+        elif dropped:
+            self.console.print(f"    [dim]… 省略 {dropped} 行上下文[/]")
+
     def confirm(self, name: str, args: dict) -> bool:
+        self.stop_thinking()
         if self.auto_approve or name in self._always:
             return True
         answer = self.console.input(
@@ -106,16 +225,32 @@ class UI:
 
     # ---- 状态与提示 ----
 
-    def set_status(self, step: int, ratio: float, tokens: int) -> None:
-        self.status_line = f"第 {step} 步 · 上下文 {ratio:.0%} · {tokens} tokens"
+    def set_status(self, step: int, ratio: float, usage) -> None:
+        """每步刷新。累计量单独记 —— 单步用量看不出一次任务总共花了多少。"""
+        self.total_in += usage.prompt_tokens
+        self.total_out += usage.completion_tokens
+        self.total_cached += usage.cache_hit_tokens
+        parts = [f"第 {step} 步", f"上下文 {ratio:.0%}", f"{usage.prompt_tokens} tokens"]
+        if usage.cache_hit_tokens and usage.prompt_tokens:
+            parts.append(f"缓存命中 {usage.cache_hit_tokens / usage.prompt_tokens:.0%}")
+        self.status_line = " · ".join(parts)
 
     def show_status(self) -> None:
-        self.console.print(f"[dim]{self.status_line or '尚无统计'}[/]")
+        if not self.status_line:
+            self.console.print("[dim]尚无统计[/]")
+            return
+        self.console.print(f"[dim]{self.status_line}[/]")
+        cached = f"（其中缓存命中 {self.total_cached}）" if self.total_cached else ""
+        self.console.print(
+            f"[dim]本会话累计：输入 {self.total_in} tokens{cached}，输出 {self.total_out} tokens[/]"
+        )
 
     def notice(self, text: str) -> None:
+        self.stop_thinking()
         self.console.print(f"[dim]— {escape(text)}[/]")
 
     def error(self, text: str) -> None:
+        self.stop_thinking()
         self.console.print(f"[bold red]错误[/] {escape(text)}")
 
     def banner(self, model: str, root, mode: str, log_path, shell=None) -> None:
@@ -123,12 +258,27 @@ class UI:
         if shell is not None:
             self.console.print(f"[dim]命令解释器 {shell.executable}[/]")
         self.console.print(f"[dim]会话记录 {log_path}[/]")
+        if not self.rich_input:
+            # 说清楚少了什么，否则用户只会发现「粘贴多行怎么变成好几条命令了」
+            self.console.print("[dim]当前终端不支持增强输入，多行粘贴与输入历史不可用[/]")
         self.console.print("[dim]/help 查看命令，Ctrl-C 中断当前任务，Ctrl-D 退出[/]\n")
 
     def prompt(self) -> str:
-        """带状态的输入提示。状态跟在提示符上方，作为常驻显示。"""
+        """带状态的输入提示。状态跟在提示符上方，作为常驻显示。
+
+        增强输入可用时，多行粘贴会整体成为一次输入而不是被拆成多条命令，
+        上下方向键翻历史。不可用时退回逐行读取，功能少但不影响使用。
+        """
+        self.stop_thinking()
         if self.status_line:
             self.console.print(f"[dim]{self.status_line}[/]")
+        if self._session is not None:
+            try:
+                return self._session.prompt(HTML("<prompt>› </prompt>"))
+            except (KeyboardInterrupt, EOFError):
+                raise  # 中断和 EOF 是正常信号，不是终端不兼容
+            except Exception:
+                self._session = None  # 这个终端用不了，之后别再试
         return self.console.input("[bold green]›[/] ")
 
 

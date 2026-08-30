@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(root / ".env")
     load_dotenv(Path(__file__).parent.parent / ".env")
 
-    ui = UI(auto_approve=args.yes)
+    ui = UI(auto_approve=args.yes, history_path=root / ".minicode" / "history")
     try:
         llm = LLMClient.from_env()
     except FatalError as e:

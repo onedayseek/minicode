@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minicode"
+version = "0.1.0"
+description = "一个跑在终端里的小型编程 agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # 仅作 HTTP 客户端使用，不使用其任何 agent / assistant 能力
+    "openai>=1.40",
+    # 终端渲染
+    "rich>=13.0",
+    # 终端输入：多行粘贴、输入历史、行内编辑
+    "prompt_toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+minicode = "minicode.cli:main"
+
+[tool.setuptools]
+packages = ["minicode", "minicode.tools"]
+
+# system prompt 是包的一部分，不打进去的话装完就找不到
+[tool.setuptools.package-data]
+minicode = ["prompts/*.md"]

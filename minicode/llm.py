@@ -35,8 +35,17 @@ def load_dotenv(path: Path) -> None:
 
 @dataclass
 class Usage:
+    """一次请求的用量。
+
+    DeepSeek 把输入拆成命中缓存和未命中两部分单独计价，且
+    prompt_tokens = cache_hit + cache_miss。只看 prompt_tokens 会以为
+    用量在跨轮次下降，实际是命中率在变。不提供这两个字段的 provider 记 0。
+    """
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
 
 class LLMClient:
@@ -97,8 +106,12 @@ class LLMClient:
             acc = ToolCallAccumulator()
             for chunk in stream:
                 if chunk.usage:
+                    u = chunk.usage
                     self.last_usage = Usage(
-                        chunk.usage.prompt_tokens, chunk.usage.completion_tokens
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        getattr(u, "prompt_cache_hit_tokens", 0) or 0,
+                        getattr(u, "prompt_cache_miss_tokens", 0) or 0,
                     )
                 if not chunk.choices:
                     continue

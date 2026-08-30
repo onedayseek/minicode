@@ -2,14 +2,14 @@
 
 一个跑在终端里的小型编程 agent。给它一个编程任务，它会自己读代码、改文件、跑测试，直到做完。
 
-从零实现，不依赖任何 agent 框架或 SDK —— 对话历史管理、工具定义与执行、模型输出解析、循环控制、错误处理都在 `minicode/` 里。第三方依赖只有 `openai`（当 HTTP 客户端用）和 `rich`（终端渲染）。
+从零实现，不依赖任何 agent 框架或 SDK —— 对话历史管理、工具定义与执行、模型输出解析、循环控制、错误处理都在 `minicode/` 里。第三方依赖只有三个：`openai`（当 HTTP 客户端用）、`rich`（终端渲染）、`prompt_toolkit`（终端输入，负责多行粘贴与输入历史）。
 
 ## 运行
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env      # 填入你的 API key
-python -m minicode
+minicode
 ```
 
 默认接 DeepSeek，改 `.env` 里的 `MINICODE_BASE_URL` / `MINICODE_MODEL` 即可换到任何 OpenAI 兼容端点。
@@ -19,12 +19,14 @@ python -m minicode
 例如在 Windows 上用 Git Bash：`MINICODE_SHELL=bash`。
 
 ```bash
-python -m minicode                          # 交互式
-python -m minicode -C ./some-project        # 指定工作目录
-python -m minicode -p "给 utils.py 补测试并跑通"   # 单次任务
-python -m minicode --resume                 # 恢复最近一次会话
-python -m minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
+minicode                          # 交互式
+minicode -C ./some-project        # 指定工作目录
+minicode -p "给 utils.py 补测试并跑通"   # 单次任务
+minicode --resume                 # 恢复最近一次会话
+minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
 ```
+
+没装的话也能直接跑：`pip install openai rich prompt_toolkit` 之后 `python -m minicode`。
 
 每次运行的会话记录写在 `工作目录/.minicode/sessions/*.jsonl`（一行一个事件，模型实际看到和产生的内容）。`--resume` 从这份记录重建对话上下文继续工作，Ctrl-C 中断或换电脑都能接着上次的进度；恢复后写新会话文件，不覆盖原记录。
 
@@ -33,7 +35,7 @@ python -m minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
 ## 测试
 
 ```bash
-pip install pytest
+pip install -e ".[dev]"
 pytest tests/
 ```
 

@@ -74,6 +74,8 @@ class SessionLog:
             tool_calls=[{"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls],
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
+            cache_hit_tokens=usage.cache_hit_tokens,
+            cache_miss_tokens=usage.cache_miss_tokens,
         )
 
     def tool_result(self, call, status: str, content: str) -> None:

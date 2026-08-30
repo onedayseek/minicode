@@ -109,6 +109,7 @@ class Agent:
                 self.ui.notice(note)
 
             self.log.request(step, self.context.render(), [t["function"]["name"] for t in self.tools.schemas()])
+            self.ui.start_thinking()
             try:
                 reply = self.llm.chat(
                     self.context.render(),
@@ -129,7 +130,7 @@ class Agent:
             self.context.prompt_tokens = self.llm.last_usage.prompt_tokens
             self.log.reply(step, reply.text, reply.tool_calls, self.llm.last_usage)
             self.context.add_assistant(reply.text, reply.tool_calls)
-            self.ui.set_status(step, self.context.usage_ratio(), self.context.prompt_tokens)
+            self.ui.set_status(step, self.context.usage_ratio(), self.llm.last_usage)
 
             # 模型不再请求动作，说明它认为这一轮做完了，把控制权还给用户
             if not reply.tool_calls:
@@ -218,5 +219,5 @@ class Agent:
     def _record(self, call: ToolCall, status: str, content: str) -> bool:
         self.context.add_tool_result(call, content)
         self.log.tool_result(call, status, content)
-        self.ui.tool_end(status, content)
+        self.ui.tool_end(call.name, status, content)
         return status != "fail"

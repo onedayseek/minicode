@@ -16,6 +16,20 @@ MAX_READ_LINES = 2000
 # 早先设成 400KB，把一整类正常文件（打包产物、CSV、日志）挡在外面，
 # 而报错还让模型用 offset / limit 重试，那条路径同样要整读，于是必然再失败一次。
 MAX_READ_BYTES = 5_000_000
+# 编辑结果里回带的 diff 行数上限。replace_all 改几十处时不能让 diff 淹掉上下文。
+MAX_DIFF_LINES = 40
+
+
+def _diff(before: str, after: str) -> str:
+    """编辑结果的紧凑 diff。
+
+    同时给两边看：模型据此确认改到了预期的位置（尤其 replace_all），
+    用户据此一眼看清改了什么。省掉 --- / +++ 两行，文件名在上一行已经说过。
+    """
+    lines = list(difflib.unified_diff(before.split("\n"), after.split("\n"), lineterm="", n=2))[2:]
+    if len(lines) > MAX_DIFF_LINES:
+        lines = lines[:MAX_DIFF_LINES] + [f"... 还有 {len(lines) - MAX_DIFF_LINES} 行改动未显示"]
+    return "\n".join(lines)
 
 
 def make_tools(root: Path, seen: set) -> list[Tool]:
@@ -93,8 +107,9 @@ def make_tools(root: Path, seen: set) -> list[Tool]:
                 f"请扩大 old_str 使其唯一，或传 replace_all=true 全部替换。"
             )
 
-        write_source(target, text.replace(needle, replacement, -1 if replace_all else 1), meta)
-        return f"已编辑 {path}（替换 {count if replace_all else 1} 处）"
+        updated = text.replace(needle, replacement, -1 if replace_all else 1)
+        write_source(target, updated, meta)
+        return f"已编辑 {path}（替换 {count if replace_all else 1} 处）\n{_diff(text, updated)}"
 
     return [
         Tool(
