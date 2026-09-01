@@ -276,13 +276,36 @@ def test_输入提示与上方内容固定留一行(monkeypatch):
     assert calls[0] == ()
 
 
-def test_状态栏显示步骤上下文和本轮用量():
+def test_状态栏只显示当前上下文():
     ui = UI()
     usage = SimpleNamespace(prompt_tokens=1234, completion_tokens=56, cache_hit_tokens=617)
+    budget = SimpleNamespace(tokens=42000, limit=1000000, ratio=0.042, calibrated=True)
 
-    ui.set_status(3, 0.42, usage)
+    ui.set_status(3, budget, usage)
 
-    assert ui.status_line == "第 3 步 · 上下文 42% · 本轮 1,234 tokens · 缓存命中 50%"
+    assert ui.status_line == "Context 42K / 1M · 4.2%"
+
+
+def test_用量统计不进入状态栏():
+    ui = UI()
+    usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, cache_hit_tokens=0)
+
+    ui.set_status(1, SimpleNamespace(tokens=12000, limit=1000000, ratio=0.012, calibrated=False), usage)
+
+    assert ui.status_line == "Context 12K / 1M · 1.2%"
+
+
+def test_usage单独显示累计API用量(capsys):
+    ui = UI()
+    ui.total_in = 924_173
+    ui.total_cached = 802_560
+    ui.total_out = 29_163
+
+    ui.show_usage()
+
+    output = capsys.readouterr().out
+    for expected in ("Session API usage", "924,173", "802,560", "121,613", "29,163"):
+        assert expected in output
 
 
 def test_banner集中显示运行环境(capsys):

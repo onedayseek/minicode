@@ -51,6 +51,14 @@ ARG_INLINE_LIMIT = 72
 HEADLINE_WIDTH = 64
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
+
+def _format_tokens(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M".replace(".0M", "M")
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    return str(value)
+
 ACCENT = "#d97757"
 # 主事件标记。模型回复和工具调用行共用它，正文因此从同一列开始。
 # 间距是这里的数据，不交给 Table 的 padding 去推导 —— 固定列宽下 padding
@@ -58,7 +66,7 @@ ACCENT = "#d97757"
 MARK = "●"
 MARK_GAP = " "
 PRIMARY_MARK = f"[bold {ACCENT}]{MARK}[/]{MARK_GAP}"
-SLASH_COMMANDS = ("/help", "/clear", "/status", "/log", "/exit")
+SLASH_COMMANDS = ("/help", "/clear", "/status", "/usage", "/compact", "/log", "/exit")
 _COMMAND_COMPLETER = WordCompleter(SLASH_COMMANDS, sentence=True)
 _AUTO_SUGGEST = AutoSuggestFromHistory()
 TOOL_LABELS = {
@@ -501,29 +509,69 @@ class UI:
 
     # ---- 状态与提示 ----
 
-    def set_status(self, step: int, ratio: float, usage) -> None:
-        """每步刷新。累计量单独记 —— 单步用量看不出一次任务总共花了多少。"""
+    def set_status(self, step: int, budget, usage) -> None:
+        """每步刷新，只显示当前 active context；累计 API 用量由 /usage 查看。"""
+        self.add_usage(usage)
+        self.status_line = f"Context {_format_tokens(budget.tokens)} / {_format_tokens(budget.limit)} · {budget.ratio:.1%}"
+
+    def add_usage(self, usage) -> None:
+        """累计一次真实 API 返回的用量。"""
         self.total_in += usage.prompt_tokens
         self.total_out += usage.completion_tokens
         self.total_cached += usage.cache_hit_tokens
-        parts = [
-            f"第 {step} 步",
-            f"上下文 {ratio:.0%}",
-            f"本轮 {usage.prompt_tokens:,} tokens",
-        ]
-        if usage.cache_hit_tokens and usage.prompt_tokens:
-            parts.append(f"缓存命中 {usage.cache_hit_tokens / usage.prompt_tokens:.0%}")
-        self.status_line = " · ".join(parts)
 
-    def show_status(self) -> None:
-        if not self.status_line:
-            self.console.print("[dim]尚无统计[/]")
+    def show_status(self, context=None, tools=None, shell=None, step=None) -> None:
+        """展示当前上下文、治理策略和运行状态。"""
+        if context is None or tools is None:
+            self.console.print(f"[dim]{self.status_line or '尚无统计'}[/]")
             return
-        self.console.print(f"[dim]{self.status_line}[/]")
-        cached = f"（其中缓存命中 {self.total_cached}）" if self.total_cached else ""
+        from .context import CHECKPOINT_RATIO, ELIDE_TOKENS, payload_chars
+
+        projected = context.render()
+        budget = context.measure(projected, tools)
+        system_chars = payload_chars(projected[:1], tools)
+        body = projected[1:]
+        checkpoint_chars = 0
+        if context.checkpoint:
+            checkpoint_chars = payload_chars(body[:1], [])
+            body = body[1:]
+        conversation_chars = payload_chars(body, []) if body else 0
+        tool_messages = [m for m in body if m.get("role") == "tool"]
+        tool_chars = payload_chars(tool_messages, []) if tool_messages else 0
+        scale = context.chars_per_token
+        self.console.print()
+        self.console.print("[bold]Context[/]")
         self.console.print(
-            f"[dim]本会话累计：输入 {self.total_in} tokens{cached}，输出 {self.total_out} tokens[/]"
+            f"  Active             {_format_tokens(budget.tokens)} / {_format_tokens(context.window)}"
+            f"   {budget.ratio:.1%}"
         )
+        self.console.print(f"  System + tools     {_format_tokens(int(system_chars / scale))}")
+        self.console.print(f"  Checkpoint         {_format_tokens(int(checkpoint_chars / scale))}")
+        self.console.print(f"  Conversation       {_format_tokens(int(conversation_chars / scale))}")
+        self.console.print(f"  Tool outputs       {_format_tokens(int(tool_chars / scale))}")
+        self.console.print()
+        self.console.print("[bold]Context management[/]")
+        self.console.print(f"  Tool cleanup       {_format_tokens(ELIDE_TOKENS)}")
+        self.console.print(f"  Checkpoint trigger {CHECKPOINT_RATIO:.0%}")
+        self.console.print(
+            f"  Last checkpoint    {'active' if context.checkpoint else 'none'}"
+        )
+        self.console.print()
+        self.console.print("[bold]Runtime[/]")
+        self.console.print(f"  Model              {getattr(self, 'model_name', 'configured')}")
+        if shell is not None:
+            self.console.print(f"  Shell              {shell.executable}")
+        if step is not None:
+            self.console.print(f"  Current step       {step} / 40")
+
+    def show_usage(self) -> None:
+        """展示累计 API 用量，不把它和 active context 混在一起。"""
+        self.console.print()
+        self.console.print("[bold]Session API usage[/]")
+        self.console.print(f"  Input total        {self.total_in:,} tokens")
+        self.console.print(f"  Cache hit          {self.total_cached:,} tokens")
+        self.console.print(f"  Cache miss         {self.total_in - self.total_cached:,} tokens")
+        self.console.print(f"  Output             {self.total_out:,} tokens")
 
     def notice(self, text: str) -> None:
         self.stop_thinking()
@@ -533,7 +581,8 @@ class UI:
         self.stop_thinking()
         self.console.print(f"[bold red]× 错误[/] {escape(text)}")
 
-    def banner(self, model: str, root, mode: str, log_path, shell=None) -> None:
+    def banner(self, model: str, root, mode: str, log_path, shell=None, context=None) -> None:
+        self.model_name = model
         lines = [
             Text.assemble(("✻ ", f"bold {ACCENT}"), ("minicode", "bold")),
             Text(""),
@@ -541,6 +590,14 @@ class UI:
             _meta_line("directory", str(root)),
             _meta_line("approval", mode),
         ]
+        if context is not None:
+            # 窗口不按模型名去猜，所以得让用户看见当前用的是什么值
+            lines.append(
+                _meta_line(
+                    "context",
+                    f"{context.window:,} tokens（输出上限 {context.max_output:,}）",
+                )
+            )
         if shell is not None:
             lines.append(_meta_line("shell", shell.executable))
             if os.environ.get("MSYSTEM") and shell.kind in ("pwsh", "powershell", "cmd"):

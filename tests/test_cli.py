@@ -44,10 +44,17 @@ def test_交互模式能启动并退出(tmp_path):
 
 
 def test_斜杠命令都不崩(tmp_path):
-    r = run_cli("-C", str(tmp_path), stdin="/help\n/status\n/log\n/clear\n/nonsense\n/exit\n")
+    r = run_cli("-C", str(tmp_path), stdin="/help\n/status\n/usage\n/log\n/clear\n/nonsense\n/exit\n")
     assert r.returncode == 0, r.stderr
     for expected in ("显示本帮助", "已清空对话历史", "未知命令"):
         assert expected in r.stdout
+    log = next((tmp_path / ".minicode" / "sessions").glob("*.jsonl"))
+    commands = [
+        json.loads(line)["command"]
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") == "command"
+    ]
+    assert commands == ["/help", "/status", "/usage", "/log", "/clear", "/nonsense", "/exit"]
 
 
 def test_会话记录被创建(tmp_path):
@@ -121,6 +128,7 @@ def fake_cli(monkeypatch, inputs, run_result=True):
         path=Path("fake.jsonl"),
         event=lambda *_args, **_kwargs: None,
         stop=lambda *_args, **_kwargs: None,
+        command=lambda *_args, **_kwargs: None,
     )
     shell = SimpleNamespace(executable="shell", kind="pwsh")
     llm = SimpleNamespace(model="test")
@@ -139,7 +147,7 @@ def fake_cli(monkeypatch, inputs, run_result=True):
     monkeypatch.setattr(cli_module, "SessionLog", lambda *_args, **_kwargs: log)
     monkeypatch.setattr(cli_module, "Agent", FakeAgent)
     monkeypatch.setattr(cli_module, "resolve_shell", lambda: shell)
-    monkeypatch.setattr(cli_module.LLMClient, "from_env", lambda: llm)
+    monkeypatch.setattr(cli_module.LLMClient, "from_env", lambda **_kwargs: llm)
     monkeypatch.setattr(cli_module, "load_dotenv", lambda _path: None)
     monkeypatch.setattr(cli_module, "load_system_prompt", lambda _root: "system")
     return captured
@@ -157,3 +165,18 @@ def test_单次模式异常终止返回非零(tmp_path, monkeypatch):
 
     assert cli_module.main(["-C", str(tmp_path), "-p", "任务"]) == 1
     assert captured == ["任务"]
+
+
+def test_上下文窗口低于项目下限时拒绝启动(tmp_path, monkeypatch):
+    fake_cli(monkeypatch, iter(()))
+    monkeypatch.setenv("MINICODE_CONTEXT_WINDOW", "8000")
+
+    assert cli_module.main(["-C", str(tmp_path)]) == 2
+
+
+def test_输出预留不小于窗口时拒绝启动(tmp_path, monkeypatch):
+    fake_cli(monkeypatch, iter(()))
+    monkeypatch.setenv("MINICODE_CONTEXT_WINDOW", "128000")
+    monkeypatch.setenv("MINICODE_MAX_OUTPUT_TOKENS", "128000")
+
+    assert cli_module.main(["-C", str(tmp_path)]) == 2

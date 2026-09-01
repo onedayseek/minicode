@@ -3,9 +3,9 @@
 import pytest
 
 from conftest import NullLog, SilentUI, assert_groups_valid
-from minicode.llm import Usage
+from minicode.context import Context
 from minicode.loop import Agent, StuckDetector, fingerprint
-from minicode.parsing import Reply, ToolCall
+from minicode.parsing import Reply, ToolCall, Usage
 from minicode.tools import resolve_shell
 
 
@@ -14,7 +14,6 @@ class ScriptedLLM:
 
     def __init__(self, replies: list[Reply]) -> None:
         self._replies = list(replies)
-        self.last_usage = Usage()
 
     @property
     def remaining(self) -> int:
@@ -94,6 +93,96 @@ def test_用户补充消息会作为工具结果回灌给模型(agent):
     assert result["role"] == "tool"
     assert "用户补充消息" in result["content"]
     assert "generated 目录需要保留" in result["content"]
+
+
+# ---- 预算与请求 ----
+
+
+def test_收敛排在终止判断前面(tmp_path):
+    """反过来的话，单步涨得猛会直接撞上硬停，而本来只要省掉几条旧工具输出就能继续。"""
+    context = Context("系统提示", window=20_000, max_output=4_000)
+    for i in range(10):
+        context.messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": f"c{i}", "type": "function",
+                     "function": {"name": "shell", "arguments": "{}"}}
+                ],
+            }
+        )
+        context.messages.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "name": "shell", "content": "x" * 6000}
+        )
+
+    ui = SilentUI()
+    agent = Agent(
+        llm=ScriptedLLM([Reply(text="接着做完了")]), root=tmp_path,
+        system_prompt="系统提示", ui=ui, log=NullLog(),
+        shell=resolve_shell(), context=context,
+    )
+
+    assert agent.context.measure(context.render(), []).ratio > 0.95  # 已经过了硬停线
+    assert agent.run("继续") is True  # 收敛之后仍然跑得下去
+    assert any("省略" in n for n in ui.notices)
+
+
+def test_日志记录的就是实际发出去的那一份(agent):
+    """投影生效后，两次 render 之间上下文可能已经变了。
+    记一份、发另一份的话，事后照着日志根本复现不出模型当时看到的东西。
+    """
+    logged, sent, rendered = [], [], []
+
+    class Spy(ScriptedLLM):
+        def chat(self, messages, tools, on_text=None, on_retry=None):
+            sent.append(messages)
+            return super().chat(messages, tools, on_text, on_retry)
+
+    real_render = agent.context.render
+    agent.context.render = lambda: (rendered.append(1), real_render())[1]
+    agent.llm = Spy([Reply(text="做完了")])
+    agent.log.request = lambda step, messages, tools, budget=None: logged.append(messages)
+
+    agent.run("任务")
+
+    assert len(rendered) == 2, "一次用于实际请求，一次用于刷新 next active context"
+    assert logged[0] is sent[0]
+
+
+def test_用量校准用的是本次请求的字符数(agent):
+    """校准配错请求的话，系数会朝错误方向漂，而且不会有任何报错。"""
+    agent.llm = ScriptedLLM([Reply(text="做完了", usage=Usage(prompt_tokens=400))])
+
+    agent.run("任务")
+
+    assert agent.context.calibrated
+    assert agent.context.last_actual_tokens == 400
+
+
+def test_每次请求按剩余窗口动态收紧输出上限(tmp_path):
+    context = Context("系统提示", window=100_000, max_output=80_000)
+    context.add_user("x" * 100_000)
+
+    class BoundedLLM(ScriptedLLM):
+        def __init__(self):
+            super().__init__([Reply(text="完成")])
+            self.max_output = 80_000
+            self.seen_limits = []
+
+        def chat(self, messages, tools, on_text=None, on_retry=None):
+            self.seen_limits.append(self.max_output)
+            return super().chat(messages, tools, on_text, on_retry)
+
+    llm = BoundedLLM()
+    agent = Agent(
+        llm=llm, root=tmp_path, system_prompt="系统提示", ui=SilentUI(),
+        log=NullLog(), shell=resolve_shell(), context=context,
+    )
+
+    assert agent.run("继续") is True
+    assert 0 < llm.seen_limits[0] < 80_000
+    assert llm.max_output == 80_000
 
 
 # ---- 卡死检测 ----

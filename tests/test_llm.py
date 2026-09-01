@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import minicode.llm as llm_module
 from minicode.errors import ContextLimitError, ProtocolError, RetryableError
-from minicode.llm import LLMClient, Usage, _classify_status_error, _retry_after_seconds
+from minicode.llm import LLMClient, _classify_status_error, _retry_after_seconds
 from minicode.parsing import Reply
 
 
@@ -23,7 +23,6 @@ def test_Retry_After秒数被解析():
 
 def test_外层重试尊重Retry_After(monkeypatch):
     client = LLMClient.__new__(LLMClient)
-    client.last_usage = Usage()
     attempts = []
     sleeps = []
 
@@ -40,22 +39,65 @@ def test_外层重试尊重Retry_After(monkeypatch):
     assert sleeps == [3.25]
 
 
+def _fake_client(chunks, max_output: int = 0):
+    seen = {}
+
+    def create(**kwargs):
+        seen.update(kwargs)
+        return chunks
+
+    client = LLMClient.__new__(LLMClient)
+    client.model = "test"
+    client.max_output = max_output
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    return client, seen
+
+
 def test_流式结束原因被保留():
     delta = SimpleNamespace(content=None, tool_calls=None)
     chunk = SimpleNamespace(
         usage=None,
         choices=[SimpleNamespace(delta=delta, finish_reason="length")],
     )
-    completions = SimpleNamespace(create=lambda **_kwargs: [chunk])
-    client = LLMClient.__new__(LLMClient)
-    client.model = "test"
-    client.last_usage = Usage(prompt_tokens=999)
-    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    client, _ = _fake_client([chunk])
 
     reply = client._chat_once([], [], lambda _text: None)
 
     assert reply.finish_reason == "length"
-    assert client.last_usage.prompt_tokens == 0
+
+
+def test_用量跟着回复走而不是挂在客户端上():
+    """provider 不返回 usage 时拿到的是零值，不会是上一次请求的残留。
+
+    用量做成返回值而不是客户端上的字段，是因为同一个 agent 会发出两种请求
+    （主循环的和压缩用的）——挂在客户端上就说不清「上一次」是哪一次了。
+    """
+    delta = SimpleNamespace(content=None, tool_calls=None)
+    quiet = SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=delta, finish_reason="stop")])
+    counted = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=999, completion_tokens=7),
+        choices=[],
+    )
+
+    client, _ = _fake_client([counted, quiet])
+    assert client._chat_once([], [], None).usage.prompt_tokens == 999
+
+    client, _ = _fake_client([quiet])
+    assert client._chat_once([], [], None).usage.prompt_tokens == 0
+
+
+def test_生成上限被传给provider():
+    """客户端把 Agent 为本次请求算出的动态输出上限传给 provider。"""
+    delta = SimpleNamespace(content=None, tool_calls=None)
+    chunk = SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=delta, finish_reason="stop")])
+
+    client, seen = _fake_client([chunk], max_output=16_384)
+    client._chat_once([], [], None)
+    assert seen["max_tokens"] == 16_384
+
+    client, seen = _fake_client([chunk], max_output=0)
+    client._chat_once([], [], None)
+    assert "max_tokens" not in seen  # 0 表示交给 provider 的默认值
 
 
 class FakeStatusError:

@@ -21,7 +21,9 @@ from openai import (
 )
 
 from .errors import ContextLimitError, FatalError, ProtocolError, RetryableError
-from .parsing import Reply, ToolCallAccumulator
+from .parsing import Reply, ToolCallAccumulator, Usage
+
+__all__ = ["LLMClient", "Usage", "load_dotenv"]
 
 
 def load_dotenv(path: Path) -> None:
@@ -36,40 +38,30 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-@dataclass
-class Usage:
-    """一次请求的用量。
-
-    DeepSeek 把输入拆成命中缓存和未命中两部分单独计价，且
-    prompt_tokens = cache_hit + cache_miss。只看 prompt_tokens 会以为
-    用量在跨轮次下降，实际是命中率在变。不提供这两个字段的 provider 记 0。
-    """
-
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cache_hit_tokens: int = 0
-    cache_miss_tokens: int = 0
-
-
 class LLMClient:
-    def __init__(self, base_url: str, model: str, api_key: str) -> None:
+    def __init__(
+        self, base_url: str, model: str, api_key: str, max_output: int = 0
+    ) -> None:
         if not api_key or api_key.startswith("sk-your-key"):
             raise FatalError(
                 "未配置 API key。请复制 .env.example 为 .env 并填入 MINICODE_API_KEY。"
             )
         self.model = model
+        # 这是 provider 能接受的最大输出 cap；Agent 会在每次请求前临时收紧它，
+        # 以便 active context、动态输出上限和安全余量共同落在真实窗口内。
+        self.max_output = max_output
         # 重试策略由这一层统一控制，避免 SDK 默认重试再叠加外层四轮重试。
         self._client = OpenAI(
             base_url=base_url, api_key=api_key, timeout=120.0, max_retries=0
         )
-        self.last_usage = Usage()
 
     @classmethod
-    def from_env(cls) -> "LLMClient":
+    def from_env(cls, max_output: int = 0) -> "LLMClient":
         return cls(
             base_url=os.environ.get("MINICODE_BASE_URL", "https://api.deepseek.com"),
-            model=os.environ.get("MINICODE_MODEL", "deepseek-chat"),
+            model=os.environ.get("MINICODE_MODEL", "deepseek-v4-flash"),
             api_key=os.environ.get("MINICODE_API_KEY", ""),
+            max_output=max_output,
         )
 
     def chat(self, messages: list[dict], tools: list[dict], on_text=None, on_retry=None) -> Reply:
@@ -105,22 +97,22 @@ class LLMClient:
         raise RetryableError("重试已用尽")  # 不会走到，兜底
 
     def _chat_once(self, messages: list[dict], tools: list[dict], on_text) -> Reply:
-        # provider 没返回 usage 时不能沿用上一轮的旧值。
-        self.last_usage = Usage()
         try:
+            extra = {"max_tokens": self.max_output} if self.max_output else {}
             stream = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=tools or None,
                 stream=True,
                 stream_options={"include_usage": True},
+                **extra,
             )
             reply = Reply()
             acc = ToolCallAccumulator()
             for chunk in stream:
                 if chunk.usage:
                     u = chunk.usage
-                    self.last_usage = Usage(
+                    reply.usage = Usage(
                         u.prompt_tokens,
                         u.completion_tokens,
                         getattr(u, "prompt_cache_hit_tokens", 0) or 0,

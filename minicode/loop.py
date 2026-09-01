@@ -6,7 +6,8 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from .context import Context
+from .compact import CompactionFailed, Compactor, shrank_enough
+from .context import Budget, Context
 from .errors import (
     ContextLimitError,
     FatalError,
@@ -19,10 +20,12 @@ from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
 from .session import SessionLog
 from .tools import Shell, build_registry, resolve_shell
+from .tools.base import cap_output
 from .tools.shell import EXIT_PREFIX
 
 MAX_STEPS = 40
 MAX_SECONDS = 15 * 60
+NEAR_LIMIT_RATIO = 0.95
 
 # 卡死的两种形态，阈值分开：一模一样的调用重复发是明确的原地打转，早点打断；
 # 同一个工具换着参数失败，可能还在正常试探（连读三个猜错的路径不算卡住），给它更多余地。
@@ -86,14 +89,17 @@ class StuckDetector:
 class Agent:
     def __init__(
         self, llm: LLMClient, root: Path, system_prompt: str, ui, log: SessionLog,
-        shell: Shell | None = None,
+        shell: Shell | None = None, context: Context | None = None,
+        compactor: "Compactor | None" = None,
     ) -> None:
         self.llm = llm
         self.root = root
         self.ui = ui
         self.log = log
-        self.context = Context(system_prompt)
+        self.context = context or Context(system_prompt)
+        self.compactor = compactor or Compactor(llm)
         self.seen_files: set[str] = set()
+        self.current_step = 0
         self.shell = shell or resolve_shell()
         self.tools = build_registry(root, self.seen_files, self.shell)
 
@@ -103,27 +109,59 @@ class Agent:
         started = time.monotonic()
         step = 0
         stuck = StuckDetector()
+        schemas = self.tools.schemas()  # 整个会话内不变
 
         while True:
             step += 1
-            stop = self._check_stop(step, started)
+            self.current_step = step
+
+            # 两级收敛，低损失的先做。工具输出全都能重新拿到，砍掉不损失
+            # 什么；而交接状态是把对话理由压成一段文字，那是有损的。
+            messages = self.context.render()
+            budget = self.context.measure(messages, schemas)
+            elision = self.context.ensure_budget(
+                budget,
+                force=budget.ratio >= NEAR_LIMIT_RATIO,
+                keep_groups=3,
+            )
+            if elision:
+                self.log.context_elision(elision.notice, elision.changes)
+                self.ui.notice(elision.notice)
+                messages = self.context.render()
+                budget = self.context.measure(messages, schemas)
+
+            if budget.needs_checkpoint:
+                try:
+                    messages, budget = self._compact(messages, budget, schemas)
+                except CompactionFailed as e:
+                    reason = f"上下文压缩失败，任务停止：{e}"
+                    self.log.stop(reason)
+                    self.ui.error(reason)
+                    return False
+
+            # 进入窗口尾部后，允许清理最近一组工具输出，尽量为本次回复留空间。
+            if budget.ratio >= NEAR_LIMIT_RATIO:
+                elision = self.context.ensure_budget(budget, force=True, keep_groups=0)
+                if elision:
+                    self.log.context_elision(elision.notice, elision.changes)
+                    self.ui.notice(elision.notice)
+                    messages = self.context.render()
+                    budget = self.context.measure(messages, schemas)
+
+            stop = self._check_stop(step, started, budget)
             if stop:
                 self.log.stop(stop.reason)
                 self.ui.notice(stop.reason)
                 return False
 
-            elision = self.context.ensure_budget()
-            if elision:
-                self.log.context_elision(elision.notice, elision.changes)
-                self.ui.notice(elision.notice)
-
-            schemas = self.tools.schemas()
-            self.log.request(step, self.context.render(), schemas)
+            # 记录的就是实际发出去的那一份 —— render 只调这一次
+            self.log.request(step, messages, schemas, budget)
             self.ui.start_thinking()
             try:
-                reply = self.llm.chat(
-                    self.context.render(),
+                reply = self._chat_with_budget(
+                    messages,
                     schemas,
+                    budget,
                     on_text=self.ui.stream,
                     on_retry=self.ui.retry_notice,
                 )
@@ -145,12 +183,14 @@ class Agent:
                 return False
 
             self.ui.end_stream()
-            self.context.prompt_tokens = self.llm.last_usage.prompt_tokens
+            # 实测值回来了，用它校准估算系数，而不是拿它当下一轮的预算
+            self.context.calibrate(reply.usage.prompt_tokens, budget.chars)
             self.log.reply(
-                step, reply.text, reply.tool_calls, self.llm.last_usage,
+                step, reply.text, reply.tool_calls, reply.usage,
                 reply.finish_reason,
             )
             if reply.finish_reason in ("length", "content_filter"):
+                self.ui.add_usage(reply.usage)
                 reason = (
                     "模型输出达到长度上限，截断的内容和工具调用均未执行。"
                     if reply.finish_reason == "length"
@@ -165,7 +205,10 @@ class Agent:
                 self.ui.error(reason)
                 return False
             self.context.add_assistant(reply.text, reply.tool_calls)
-            self.ui.set_status(step, self.context.usage_ratio(), self.llm.last_usage)
+            # 状态栏展示的是“下一次请求会看到的 active context”，不是刚发出去
+            # 那一份。回复已经进入历史，因此要在这里重新渲染和估算。
+            next_budget = self.context.measure(self.context.render(), schemas)
+            self.ui.set_status(step, next_budget, reply.usage)
 
             # 模型不再请求动作，说明它认为这一轮做完了，把控制权还给用户
             if not reply.tool_calls:
@@ -175,14 +218,109 @@ class Agent:
             if self._execute(reply.tool_calls, stuck):
                 return False
 
-    def _check_stop(self, step: int, started: float) -> Stop | None:
+    def compact_now(self, schemas: list[dict] | None = None) -> str:
+        """手动触发收敛，返回给用户看的说明。
+
+        走的是和自动路径一样的两级流水线：先收敛工具输出（无损，重调即可拿回），
+        再做交接压缩（有损）。只做第二级的话，在工具输出主导的会话里几乎没有
+        效果 —— 大头都在被保护的最近几组里，压缩根本碰不到。
+
+        /compact 是刚需而非锦上添花：窗口大到 1M 时自然触发极难，没有手动入口
+        的话，这个能力实际上没法验证也没法演示。
+        """
+        schemas = self.tools.schemas() if schemas is None else schemas
+        before = self.context.measure(self.context.render(), schemas)
+
+        notes = []
+        elision = self.context.ensure_budget(before, force=True, keep_groups=1)
+        if elision:
+            self.log.context_elision(elision.notice, elision.changes)
+            notes.append(f"省略了 {len(elision.changes)} 条较早的工具输出")
+
+        try:
+            checkpoint = self._run_compactor()
+        except CompactionFailed as e:
+            after = self.context.measure(self.context.render(), schemas)
+            if not notes:
+                return str(e)
+            return (
+                f"{'；'.join(notes)}。{e}"
+                f"估算 {before.tokens:,} → {after.tokens:,} tokens"
+            )
+
+        self.context.checkpoint = checkpoint
+        self.log.checkpoint(checkpoint.summary, checkpoint.covers)
+        after = self.context.measure(self.context.render(), schemas)
+        notes.append(f"{checkpoint.covers - 1} 条历史收进了交接状态")
+        return (
+            f"{'；'.join(notes)}。估算 {before.tokens:,} → {after.tokens:,} tokens"
+            f"（历史仍完整保留在会话记录里）"
+        )
+
+    def _compact(self, messages: list[dict], budget: Budget, schemas: list[dict]):
+        """自动压缩。失败或降幅不够都交给 run() 停止当前任务。"""
+        self.ui.notice("上下文仍然偏大，正在收敛成交接状态…")
+        try:
+            checkpoint = self._run_compactor()
+        except CompactionFailed as e:
+            self.log.system_note(f"压缩未执行：{e}")
+            raise
+
+        previous = self.context.checkpoint
+        self.context.checkpoint = checkpoint
+        new_messages = self.context.render()
+        new_budget = self.context.measure(new_messages, schemas)
+
+        if not shrank_enough(budget.tokens, new_budget.tokens):
+            # 降幅不够说明这次压缩没有解决预算问题，当前任务不能安全继续。
+            self.context.checkpoint = previous
+            self.ui.notice("收敛后体量没有明显下降，已放弃压缩。")
+            raise CompactionFailed("收敛后体量没有明显下降。")
+
+        self.log.checkpoint(checkpoint.summary, checkpoint.covers)
+        self.ui.notice(
+            f"已收敛为交接状态：估算 {budget.tokens:,} → {new_budget.tokens:,} tokens"
+        )
+        return new_messages, new_budget
+
+    def _run_compactor(self):
+        """交接状态应当简洁，不使用 provider 的超大输出能力上限。"""
+        previous = getattr(self.llm, "max_output", None)
+        if previous is not None:
+            self.llm.max_output = min(previous, 32_000)
+        try:
+            return self.compactor.compact(self.context)
+        finally:
+            usage = getattr(self.compactor, "last_usage", None)
+            if usage is not None:
+                self.ui.add_usage(usage)
+                if hasattr(self.log, "compaction_usage"):
+                    self.log.compaction_usage(usage)
+            if previous is not None:
+                self.llm.max_output = previous
+
+    def _check_stop(self, step: int, started: float, budget: Budget) -> Stop | None:
         if step > MAX_STEPS:
             return Stop(f"已达步数上限（{MAX_STEPS} 步）。可以再发一条消息让它继续。")
         if time.monotonic() - started > MAX_SECONDS:
             return Stop("单次任务已超时，已中断。")
-        if self.context.usage_ratio() > 0.95:
-            return Stop("上下文接近上限，请用 /clear 开新会话。", fatal=True)
+        if not budget.has_room:
+            return Stop(
+                "上下文已接近模型上限，清理和交接压缩都无法继续。请用 /clear 开新会话。",
+                fatal=True,
+            )
         return None
+
+    def _chat_with_budget(self, messages, schemas, budget: Budget, **kwargs):
+        """给真实客户端设置本次动态输出上限；测试替身无需支持新参数。"""
+        if not hasattr(self.llm, "max_output"):
+            return self.llm.chat(messages, schemas, **kwargs)
+        previous = self.llm.max_output
+        self.llm.max_output = budget.output_budget
+        try:
+            return self.llm.chat(messages, schemas, **kwargs)
+        finally:
+            self.llm.max_output = previous
 
     def _execute(self, calls: list[ToolCall], stuck: StuckDetector) -> bool:
         """执行本轮的全部调用。返回 True 表示该终止整个任务。"""
@@ -238,6 +376,8 @@ class Agent:
                 raise UserAbort(f"用户拒绝了这次操作{detail}")
 
             result = tool.run(**args)
+            raw_result = getattr(tool, "last_raw_result", None) or result
+            result = cap_output(result)
 
         except UserAbort as e:
             return self._record(call, "fail", f"[已取消] {e}")
@@ -252,7 +392,12 @@ class Agent:
 
         # 命令退出码非零不算工具失败：模型需要读那段输出才能修问题，
         # 也不该让连续的测试失败触发卡死检测。
-        return self._record(call, "warn" if result.startswith(EXIT_PREFIX) else "ok", result)
+        return self._record(
+            call,
+            "warn" if result.startswith(EXIT_PREFIX) else "ok",
+            result,
+            raw_content=raw_result if raw_result != result else None,
+        )
 
     def _close_pending(
         self,
@@ -267,8 +412,11 @@ class Agent:
         for call in calls:
             self._record(call, "fail", content)
 
-    def _record(self, call: ToolCall, status: str, content: str) -> bool:
+    def _record(self, call: ToolCall, status: str, content: str, raw_content: str | None = None) -> bool:
         self.context.add_tool_result(call, content)
-        self.log.tool_result(call, status, content)
+        if raw_content is None:
+            self.log.tool_result(call, status, content)
+        else:
+            self.log.tool_result(call, status, content, raw_content=raw_content)
         self.ui.tool_end(call.name, status, content)
         return status != "fail"

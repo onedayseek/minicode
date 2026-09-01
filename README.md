@@ -12,7 +12,10 @@ cp .env.example .env      # 填入你的 API key
 minicode
 ```
 
-默认接 DeepSeek，改 `.env` 里的 `MINICODE_BASE_URL` / `MINICODE_MODEL` 即可换到任何 OpenAI 兼容端点。
+默认接 DeepSeek V4 Flash（1M 上下文、384K 输出）。可在 `.env` 里覆盖
+`MINICODE_CONTEXT_WINDOW`（上下文窗口）和 `MINICODE_MAX_OUTPUT_TOKENS`（单次生成上限，
+每次请求会按剩余窗口动态收紧）；输出上限必须小于上下文窗口，配置不合法时启动会拒绝。
+如需换到其他模型，请按该模型的官方限制自行设置这两个值。
 
 命令解释器在启动时自动解析（Windows 上 `pwsh` → `powershell` → `cmd`，其它平台 `bash` → `sh`），
 解析结果会写进 `shell` 工具的描述交给模型。要指定别的解释器就设 `MINICODE_SHELL`，
@@ -30,9 +33,12 @@ minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
 
 每次运行的会话记录写在 `工作目录/.minicode/sessions/*.jsonl`（一行一个事件，模型实际看到和产生的内容）。`--resume` 从这份记录重建对话上下文继续工作，Ctrl-C 中断或换电脑都能接着上次的进度；恢复后写新会话文件，不覆盖原记录。
 
-交互模式下可用 `/help` `/clear` `/status` `/log` `/exit`；输入 `/` 会显示命令补全，
+交互模式下可用 `/help` `/clear` `/status` `/usage` `/compact` `/log` `/exit`；输入 `/` 会显示命令补全，
 灰色的历史建议可按 Tab 接受，Alt+Enter 或 Ctrl-J 可在同一条消息中手动换行。
 写操作审批使用方向键选择、Enter 确认，Esc 可直接拒绝。
+
+工具结果统一限制为最多 30,000 个字符，过长时保留开头和结尾；`/status` 显示当前 active context 与运行状态，`/usage` 显示累计 API 用量，`/compact` 手动把较早历史收敛成交接状态。
+历史本身只增不改 —— 收敛和压缩改的是「这一轮让模型看到什么」，原文始终留在会话记录里。
 
 ## 测试
 
@@ -47,7 +53,8 @@ pytest tests/
 minicode/
 ├── cli.py        REPL、斜杠命令、参数
 ├── loop.py       主循环、终止条件、工具分发
-├── context.py    对话历史、token 记账、预算控制
+├── context.py    历史与上下文投影、token 预算
+├── compact.py    交接式压缩
 ├── llm.py        provider 配置、流式请求、退避重试
 ├── parsing.py    流式 tool_calls 累积、JSON 修复、schema 校验
 ├── errors.py     错误分级

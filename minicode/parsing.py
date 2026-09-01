@@ -25,12 +25,32 @@ class ToolCall:
 
 
 @dataclass
+class Usage:
+    """一次请求的用量。
+
+    DeepSeek 把输入拆成命中缓存和未命中两部分单独计价，且
+    prompt_tokens = cache_hit + cache_miss。只看 prompt_tokens 会以为
+    用量在跨轮次下降，实际是命中率在变。不提供这两个字段的 provider 记 0。
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+
+
+@dataclass
 class Reply:
-    """模型一轮回复的解析结果。"""
+    """模型一轮回复的解析结果。
+
+    usage 跟着回复走，而不是挂在客户端上：一旦同一个 agent 会发出两种请求
+    （主循环的和压缩用的），"上一次的用量"就说不清是哪一次了。
+    """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    usage: Usage = field(default_factory=Usage)
 
 
 class ToolCallAccumulator:

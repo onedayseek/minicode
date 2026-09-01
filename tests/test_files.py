@@ -6,6 +6,7 @@ import pytest
 
 from minicode.errors import ToolError
 from minicode.tools import build_registry
+from minicode.tools.base import MAX_TOOL_OUTPUT_CHARS
 from minicode.tools import textfile
 from minicode.tools.textfile import TextMeta, decode_bytes, detect_eol, read_source, write_source
 
@@ -122,6 +123,16 @@ def test_read_file拒绝负数limit(tools, tmp_path):
     (tmp_path / "a.py").write_text("a\nb\nc\n", encoding="utf-8")
     with pytest.raises(ToolError, match="大于 0"):
         run["read_file"]("a.py", limit=-1)
+
+
+def test_工具结果统一限制大小(tools, tmp_path):
+    run, _ = tools
+    (tmp_path / "large.txt").write_text("x" * (MAX_TOOL_OUTPUT_CHARS * 2), encoding="utf-8")
+
+    result = run["read_file"]("large.txt")
+
+    assert len(result) <= MAX_TOOL_OUTPUT_CHARS
+    assert "中间" in result and "字符已省略" in result
 
 
 def test_原编码无法表示新字符时不修改文件(tmp_path):
