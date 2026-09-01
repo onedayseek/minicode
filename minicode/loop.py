@@ -20,7 +20,7 @@ from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
 from .session import SessionLog
 from .tools import Shell, build_registry, resolve_shell
-from .tools.base import cap_output
+from .tools.base import cap_output, extract_intent
 from .tools.shell import EXIT_PREFIX
 
 MAX_STEPS = 40
@@ -44,7 +44,10 @@ def fingerprint(call: ToolCall) -> tuple[str, str]:
     不该让两次实际相同的调用看起来像是不同的尝试。
     """
     try:
-        args = json.dumps(json.loads(call.arguments), sort_keys=True, ensure_ascii=False)
+        parsed = json.loads(call.arguments)
+        if isinstance(parsed, dict):
+            parsed.pop("intent", None)  # 展示文案变化不代表实际调用发生了变化
+        args = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
     except (json.JSONDecodeError, TypeError):
         args = call.arguments.strip()
     return call.name, args
@@ -100,6 +103,7 @@ class Agent:
         self.compactor = compactor or Compactor(llm)
         self.seen_files: set[str] = set()
         self.current_step = 0
+        self._last_dispatch_rejected = False
         self.shell = shell or resolve_shell()
         self.tools = build_registry(root, self.seen_files, self.shell)
 
@@ -335,6 +339,15 @@ class Agent:
                 self._close_pending(calls[index:])
                 raise
 
+            if self._last_dispatch_rejected:
+                # API 要求 assistant 声明的每个 tool_call 都有结果，但不要求真的执行。
+                # 用户拒绝已经改变了计划，取消剩余调用并闭合整组，下一轮立刻回给模型。
+                self._close_pending(
+                    calls[index + 1 :],
+                    "[未执行] 用户拒绝了本轮操作，剩余调用已取消。",
+                )
+                return False
+
             reason = stuck.record(call, ok)
             if not reason:
                 continue
@@ -364,11 +377,13 @@ class Agent:
         任何失败都以 tool result 的形式回灌，而不是抛出 —— 一个工具出错
         不应该终止整个会话，模型往往能自己纠正。
         """
+        self._last_dispatch_rejected = False
         try:
             tool = self.tools.get(call.name)
             args = parse_arguments(call)
+            intent = extract_intent(args, call.name)
             args = validate(args, tool.parameters, call.name)
-            self.ui.tool_start(call.name, args, tool.primary)
+            self.ui.tool_start(call.name, args, tool.primary, intent=intent)
 
             if tool.writes and not self.ui.confirm(call.name, args):
                 message = getattr(self.ui, "supplemental_message", "").strip()
@@ -380,6 +395,7 @@ class Agent:
             result = cap_output(result)
 
         except UserAbort as e:
+            self._last_dispatch_rejected = True
             return self._record(call, "fail", f"[已取消] {e}")
         except ToolError as e:
             return self._record(call, "fail", f"错误：{e}")

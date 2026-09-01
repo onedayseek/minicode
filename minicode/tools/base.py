@@ -14,6 +14,8 @@ from ..errors import ToolError
 # 工具结果是每一轮上下文里最容易失控的部分。各工具仍按自己的语义做更细的
 # 限制，但这里保留最后一道统一上限，避免新工具忘了加限制就把整段会话撑爆。
 MAX_TOOL_OUTPUT_CHARS = 30_000
+INTENT_FIELD = "intent"
+INTENT_MAX_CHARS = 120
 
 
 def cap_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -31,6 +33,22 @@ def cap_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     omitted = len(text) - head - tail
     marker = f"\n\n... [中间 {omitted} 字符已省略] ...\n\n"
     return f"{text[:head]}{marker}{text[-tail:] if tail else ''}"[:limit]
+
+
+def extract_intent(args: dict, tool_name: str) -> str:
+    """取出每次调用的审批意图；它属于框架元数据，不传给本地工具函数。"""
+    value = args.pop(INTENT_FIELD, None)
+    if not isinstance(value, str):
+        raise ToolError(f"{tool_name} 缺少必填的调用意图 `intent`，请说明这次调用要达到什么目的。")
+    intent = " ".join(value.split())
+    if not intent:
+        raise ToolError(f"{tool_name} 的调用意图 `intent` 不能为空。")
+    if len(intent) > INTENT_MAX_CHARS:
+        raise ToolError(
+            f"{tool_name} 的调用意图 `intent` 不能超过 {INTENT_MAX_CHARS} 个字符，"
+            f"当前为 {len(intent)} 个字符。"
+        )
+    return intent
 
 
 @dataclass
@@ -62,6 +80,22 @@ class Tool:
         return next(iter(self.parameters.get("required", [])), None)
 
     def schema(self) -> dict:
+        properties = {
+            INTENT_FIELD: {
+                "type": "string",
+                "maxLength": INTENT_MAX_CHARS,
+                "description": (
+                    "向用户说明这一次工具调用的具体目的，用于辅助审批。"
+                    "单行、简洁，不复述参数，不超过 120 个字符。"
+                ),
+            },
+            **self.parameters.get("properties", {}),
+        }
+        parameters = {
+            **self.parameters,
+            "properties": properties,
+            "required": [INTENT_FIELD, *self.parameters.get("required", [])],
+        }
         return {
             "type": "function",
             "function": {
@@ -70,7 +104,7 @@ class Tool:
                     f"{self.description}\n返回结果最多 {MAX_TOOL_OUTPUT_CHARS} 个字符，"
                     "过长时保留开头和结尾。"
                 ),
-                "parameters": self.parameters,
+                "parameters": parameters,
             },
         }
 

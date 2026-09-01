@@ -43,6 +43,12 @@ def test_交互模式能启动并退出(tmp_path):
     assert "shell" in r.stdout  # 解析到的解释器要显示出来
 
 
+def test_系统提示要求工具调用前说明意图(tmp_path):
+    prompt = cli_module.load_system_prompt(tmp_path)
+    assert "每个工具调用" in prompt
+    assert "`intent`" in prompt
+
+
 def test_斜杠命令都不崩(tmp_path):
     r = run_cli("-C", str(tmp_path), stdin="/help\n/status\n/usage\n/log\n/clear\n/nonsense\n/exit\n")
     assert r.returncode == 0, r.stderr

@@ -122,6 +122,34 @@ def test_模型回复支持Markdown渲染(capsys):
     assert "```" not in output
 
 
+def test_长回复按终端宽度换行而不是省略():
+    output = io.StringIO()
+    ui = UI()
+    ui.console = Console(file=output, width=80, color_system=None)
+    text = (
+        "这个问题要分成三层，因为我对自己感知的描述有诚实度的边界。"
+        "我把「物理机制」「我能确认访问到什么」「我的主观体验」分开讲。"
+    )
+
+    ui.stream(text)
+    ui.end_stream()
+
+    rendered = output.getvalue()
+    assert "分开讲。" in rendered
+    assert "…" not in rendered
+
+
+def test_Markdown列表与内联代码使用低对比主题():
+    ui = UI()
+
+    bullet = ui.console.get_style("markdown.item.bullet")
+    code = ui.console.get_style("markdown.code")
+
+    assert bullet.color and bullet.color.get_truecolor().red == 0x8A
+    assert code.color and code.color.get_truecolor().red == 0xD0
+    assert code.bgcolor and code.bgcolor.get_truecolor().red == 0x30
+
+
 def test_分块到达的Markdown按完整回复解析(capsys):
     ui = UI()
     ui.stream("这是 **重")
@@ -264,6 +292,21 @@ def test_工具块与最终回复之间固定留一行(capsys):
     result = next(i for i, line in enumerate(lines) if "⎿ 读取完成" in line)
     reply = next(i for i, line in enumerate(lines) if "任务完成" in line)
     assert [line.strip() for line in lines[result + 1 : reply]] == [""]
+
+
+def test_工具调用旁展示转义后的独立意图(capsys):
+    ui = UI()
+
+    ui.tool_start(
+        "shell",
+        {"command": "pytest -q"},
+        "command",
+        intent="运行测试，确认 [bold red]修改[/] 没有回归",
+    )
+
+    output = capsys.readouterr().out
+    assert "意图：运行测试" in output
+    assert "[bold red]修改[/]" in output
 
 
 def test_输入提示与上方内容固定留一行(monkeypatch):

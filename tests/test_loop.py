@@ -1,5 +1,7 @@
 """主循环：中断时的历史闭合，以及卡死检测的粒度。"""
 
+import json
+
 import pytest
 
 from conftest import NullLog, SilentUI, assert_groups_valid
@@ -24,6 +26,14 @@ class ScriptedLLM:
 
 
 def call(cid: str, name: str = "read_file", arguments: str = '{"path":"没有这个文件.py"}'):
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(parsed, dict):
+            parsed.setdefault("intent", "测试这次工具调用")
+            arguments = json.dumps(parsed, ensure_ascii=False)
     return ToolCall(id=cid, name=name, arguments=arguments)
 
 
@@ -93,6 +103,47 @@ def test_用户补充消息会作为工具结果回灌给模型(agent):
     assert result["role"] == "tool"
     assert "用户补充消息" in result["content"]
     assert "generated 目录需要保留" in result["content"]
+
+
+def test_intent只用于展示不会传给本地工具(agent):
+    seen = {}
+    tool = agent.tools.get("read_file")
+    tool.run = lambda **kwargs: (seen.update(kwargs), "读取完成")[1]
+
+    assert agent._dispatch(call(
+        "A", "read_file",
+        '{"intent":"确认配置来源","path":"config.py"}',
+    )) is True
+
+    assert seen == {"path": "config.py"}
+
+
+def test_缺少intent时不执行工具(agent):
+    executed = []
+    agent.tools.get("read_file").run = lambda **kwargs: executed.append(kwargs) or "不该执行"
+    missing = ToolCall("A", "read_file", '{"path":"config.py"}')
+
+    assert agent._dispatch(missing) is False
+
+    assert executed == []
+    assert "intent" in agent.context.messages[-1]["content"]
+
+
+def test_拒绝后取消本组剩余调用并立刻回给模型(agent):
+    calls = [
+        call("A", "shell", '{"command":"Remove-Item generated -Recurse"}'),
+        call("B", "read_file", '{"path":"随后不该读取.py"}'),
+    ]
+    agent.context.add_assistant("准备执行", calls)
+    agent.ui.approve = False
+
+    assert agent._execute(calls, StuckDetector()) is False
+
+    results = [m for m in agent.context.messages if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in results] == ["A", "B"]
+    assert "已取消" in results[0]["content"]
+    assert "剩余调用已取消" in results[1]["content"]
+    assert_groups_valid(agent.context.messages)
 
 
 # ---- 预算与请求 ----
@@ -193,6 +244,12 @@ def test_调用指纹忽略键序与空白():
     b = call("2", "edit_file", '{"old_str":"x","path":"a.py"}')
     assert fingerprint(a) == fingerprint(b)
     assert fingerprint(a) != fingerprint(call("3", "edit_file", '{"path":"b.py","old_str":"x"}'))
+
+
+def test_调用指纹忽略intent措辞变化():
+    a = call("1", "read_file", '{"intent":"读取配置","path":"a.py"}')
+    b = call("2", "read_file", '{"intent":"确认配置来源","path":"a.py"}')
+    assert fingerprint(a) == fingerprint(b)
 
 
 def test_参数不是合法JSON时指纹退回原文():

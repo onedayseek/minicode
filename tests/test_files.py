@@ -135,6 +135,15 @@ def test_工具结果统一限制大小(tools, tmp_path):
     assert "中间" in result and "字符已省略" in result
 
 
+def test_每个工具schema都要求独立intent(tmp_path):
+    schemas = build_registry(tmp_path, set()).schemas()
+
+    for schema in schemas:
+        parameters = schema["function"]["parameters"]
+        assert "intent" in parameters["required"]
+        assert parameters["properties"]["intent"]["maxLength"] == 120
+
+
 def test_原编码无法表示新字符时不修改文件(tmp_path):
     target = tmp_path / "ascii.txt"
     target.write_bytes(b"original\n")

@@ -35,6 +35,7 @@ from rich.rule import Rule
 from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 # 工具结果：几行足够判断「做了什么、成没成」
 RESULT_MAX_LINES = 5
@@ -60,6 +61,16 @@ def _format_tokens(value: int) -> str:
     return str(value)
 
 ACCENT = "#d97757"
+_TERMINAL_THEME = Theme(
+    {
+        "markdown.list": "none",
+        "markdown.item": "none",
+        "markdown.item.bullet": "#8a8a8a",
+        "markdown.item.number": "#8a8a8a",
+        "markdown.code": "not bold #d0d0d0 on #303030",
+    },
+    inherit=True,
+)
 # 主事件标记。模型回复和工具调用行共用它，正文因此从同一列开始。
 # 间距是这里的数据，不交给 Table 的 padding 去推导 —— 固定列宽下 padding
 # 的取值各版本不一致，同一份代码会时而对齐、时而错开一格。
@@ -235,7 +246,7 @@ class UI:
         ptk_input=None,
         ptk_output=None,
     ) -> None:
-        self.console = Console()
+        self.console = Console(theme=_TERMINAL_THEME)
         self.auto_approve = auto_approve
         self._always: set[str] = set()
         self._streaming = False
@@ -349,7 +360,13 @@ class UI:
 
     # ---- 工具调用 ----
 
-    def tool_start(self, name: str, args: dict, primary: str | None = None) -> None:
+    def tool_start(
+        self,
+        name: str,
+        args: dict,
+        primary: str | None = None,
+        intent: str = "",
+    ) -> None:
         """摘要一行 + 完整参数。审批依据不做内容截断。"""
         self.stop_thinking()
         self.console.print()
@@ -357,6 +374,8 @@ class UI:
         self.console.print(
             f"{PRIMARY_MARK}[bold]{label}[/]({escape(_headline(args, primary))})"
         )
+        if intent:
+            self.console.print(f"  [dim]│ 意图：[/]{escape(intent)}")
 
         if name == "edit_file" and self._preview_edit(args):
             return
@@ -649,7 +668,8 @@ class UI:
                 function = call.get("function") or {}
                 name = message.get("name") or function.get("name") or "tool"
                 args = _display_arguments(function.get("arguments", ""))
-                self.tool_start(name, args, next(iter(args), None))
+                intent = args.pop("intent", "")
+                self.tool_start(name, args, next(iter(args), None), intent=intent)
                 status = tool_statuses.get(call_id, "ok")
                 self.tool_end(name, status if status in ("ok", "warn", "fail") else "ok", content)
 
@@ -766,7 +786,9 @@ def _response_grid(marker: bool, body) -> Table:
     """
     table = Table.grid(padding=0, expand=False)
     table.add_column(width=len(MARK + MARK_GAP), no_wrap=True)
-    table.add_column()
+    # Rich 表格正文列默认 overflow=ellipsis；长段落因此会在行尾静默丢字。
+    # 明确使用 fold，让 JSONL 中的完整回复在终端按宽度换行展示。
+    table.add_column(overflow="fold")
     # 续块不重复打标记，但空出同样的宽度，正文仍与首块对齐
     head = MARK + MARK_GAP if marker else " " * len(MARK + MARK_GAP)
     table.add_row(Text(head, style=f"bold {ACCENT}"), body)

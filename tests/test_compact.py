@@ -252,7 +252,10 @@ def test_压缩失败后不发送主循环请求(tmp_path):
             self.steps += 1
             if self.steps < 3:
                 return Reply(
-                    tool_calls=[ToolCall(id=f"t{self.steps}", name="list_files", arguments="{}")]
+                    tool_calls=[ToolCall(
+                        id=f"t{self.steps}", name="list_files",
+                        arguments='{"intent":"查看项目文件"}',
+                    )]
                 )
             return Reply(text="做完了")
 
