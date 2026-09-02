@@ -582,7 +582,9 @@ class UI:
         if shell is not None:
             self.console.print(f"  Shell              {shell.executable}")
         if step is not None:
-            self.console.print(f"  Current step       {step} / 40")
+            from .loop import MAX_STEPS
+
+            self.console.print(f"  Current step       {step} / {MAX_STEPS}")
 
     def show_usage(self) -> None:
         """展示累计 API 用量，不把它和 active context 混在一起。"""

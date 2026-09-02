@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.segment import Segment
 from rich.style import Style
 import minicode.ui as ui_module
+import minicode.loop as loop_module
+from minicode.context import Context
 from minicode.ui import UI
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -360,6 +362,15 @@ def test_banner集中显示运行环境(capsys):
     output = capsys.readouterr().out
     for expected in ("✻ minicode", "deepseek-chat", "/work/demo", "写操作需确认", "pwsh"):
         assert expected in output
+
+
+def test_status使用主循环的步数上限(monkeypatch, capsys):
+    monkeypatch.setattr(loop_module, "MAX_STEPS", 7)
+    ui = UI()
+
+    ui.show_status(Context("system", window=128_000), [], step=3)
+
+    assert "Current step       3 / 7" in capsys.readouterr().out
 
 
 def test_恢复历史会显示用户模型和工具轨迹(capsys):

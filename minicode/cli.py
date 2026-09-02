@@ -68,7 +68,12 @@ def _resolve_resume(resume, root: Path) -> Path | None:
         return files[0]
     p = Path(resume)
     if not p.is_absolute():
-        p = sess_dir / p
+        # 接受帮助文本中展示的完整相对路径，也接受 sessions 下的文件名。
+        # 后者保持优先，避免工作目录里同名文件改变 --resume 的含义。
+        if p.parts[:2] == (".minicode", "sessions"):
+            p = root / p
+        else:
+            p = sess_dir / p
     if not p.exists():
         print(f"会话文件不存在：{p}", file=sys.stderr)
         return None
@@ -188,7 +193,14 @@ def main(argv: list[str] | None = None) -> int:
             runner.restore_state(restored.active_task, restored.workflow_state)
 
     if args.prompt:
-        return 0 if runner.run(args.prompt) else 1
+        try:
+            completed = runner.run(args.prompt)
+        except KeyboardInterrupt:
+            ui.end_stream()
+            log.stop("用户中断")
+            ui.notice("已中断。对话历史保留，可以用 --resume 继续。")
+            return 130
+        return 0 if completed else 1
 
     ui.banner(
         llm.model,

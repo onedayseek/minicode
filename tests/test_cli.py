@@ -89,6 +89,15 @@ def test_resume文件不存在(tmp_path):
     assert r.returncode == 2
 
 
+def test_resume接受sessions目录的完整相对路径(tmp_path):
+    sessions = tmp_path / ".minicode" / "sessions"
+    sessions.mkdir(parents=True)
+    path = sessions / "old.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+
+    assert cli_module._resolve_resume(".minicode/sessions/old.jsonl", tmp_path) == path
+
+
 def test_没有会话可恢复(tmp_path):
     r = run_cli("-C", str(tmp_path), "--resume")
     assert r.returncode == 2
@@ -134,6 +143,7 @@ def fake_cli(monkeypatch, inputs, run_result=True):
         banner=lambda *_args, **_kwargs: None,
         notice=lambda *_args, **_kwargs: None,
         error=lambda *_args, **_kwargs: None,
+        end_stream=lambda: None,
         status_line="",
     )
     log = SimpleNamespace(
@@ -176,6 +186,26 @@ def test_单次模式异常终止返回非零(tmp_path, monkeypatch):
     captured = fake_cli(monkeypatch, iter(()), run_result=False)
 
     assert cli_module.main(["-C", str(tmp_path), "-p", "任务"]) == 1
+    assert captured == ["任务"]
+
+
+def test_单次模式中断时不打印traceback(tmp_path, monkeypatch):
+    captured = []
+    fake_cli(monkeypatch, iter(()))
+
+    class InterruptingAgent:
+        def __init__(self, *_args, **_kwargs):
+            self.context = SimpleNamespace(reset=lambda: None)
+            self.seen_files = set()
+            self.shell = SimpleNamespace(executable="shell", kind="pwsh")
+
+        def run(self, text):
+            captured.append(text)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "Agent", InterruptingAgent)
+
+    assert cli_module.main(["-C", str(tmp_path), "-p", "任务"]) == 130
     assert captured == ["任务"]
 
 

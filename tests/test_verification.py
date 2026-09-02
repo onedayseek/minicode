@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import minicode.verification as verification_module
 from minicode.errors import ToolError
 from minicode.parsing import Reply, ToolCall
 from minicode.session import SessionLog, load_session
@@ -301,6 +302,28 @@ def test_用户拒绝权威命令后不会把取消当成代码失败(tmp_path):
     )
 
     assert workflow._run_plan(plan, 1)[0] is None
+
+
+@pytest.mark.parametrize("case", ["cancelled", "time_limit", "developer_stopped"])
+def test_验证失败出口都会落盘idle状态(tmp_path, monkeypatch, case):
+    developer = FakeDeveloper(results=[True, False])
+    workflow = make_workflow(tmp_path, developer, approve=case != "cancelled")
+    plan = VerificationPlan(
+        "python -m pytest -q", ("tests/test_app.py",), "测试", ("主要行为",)
+    )
+    monkeypatch.setattr(workflow, "_design", lambda *_args: plan)
+    if case == "cancelled":
+        pass
+    elif case == "time_limit":
+        clock = iter([0, 999_999])
+        monkeypatch.setattr(verification_module.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(workflow, "_run_plan", lambda *_args: (False, "失败"))
+    else:
+        monkeypatch.setattr(workflow, "_run_plan", lambda *_args: (False, "失败"))
+
+    assert workflow.run("实现解析器") is False
+    workflow_tasks = [fields for kind, fields in workflow.log.events if kind == "workflow_task"]
+    assert workflow_tasks[-1] == {"task": None, "state": "idle"}
 
 
 def test_Verifier事件不污染恢复但计入用量(tmp_path):

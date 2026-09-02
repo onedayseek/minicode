@@ -332,6 +332,7 @@ class VerificationWorkflow:
                     rounds=round_no,
                 )
                 self.state = "idle"
+                self.log.workflow_task(None, self.state)
                 return False
             if passed:
                 self.ui.notice(
@@ -366,6 +367,7 @@ class VerificationWorkflow:
                     rounds=round_no,
                 )
                 self.state = "idle"
+                self.log.workflow_task(None, self.state)
                 return False
 
             feedback = self._repair_feedback(self.active_task or user_input, plan, output, round_no)
@@ -379,6 +381,7 @@ class VerificationWorkflow:
                     command=plan.command,
                     rounds=round_no,
                 )
+                self.log.workflow_task(None, self.state)
                 return False
 
     def _design(self, task: str, changed_files: set[str]) -> VerificationPlan | None:
