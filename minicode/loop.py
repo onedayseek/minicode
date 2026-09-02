@@ -19,7 +19,7 @@ from .errors import (
 from .llm import LLMClient
 from .parsing import ToolCall, parse_arguments, validate
 from .session import SessionLog
-from .tools import Shell, build_registry, resolve_shell
+from .tools import Registry, Shell, build_registry, resolve_shell
 from .tools.base import cap_output, extract_intent
 from .tools.shell import EXIT_PREFIX
 
@@ -94,6 +94,8 @@ class Agent:
         self, llm: LLMClient, root: Path, system_prompt: str, ui, log: SessionLog,
         shell: Shell | None = None, context: Context | None = None,
         compactor: "Compactor | None" = None,
+        tools: Registry | None = None,
+        tool_policy=None,
     ) -> None:
         self.llm = llm
         self.root = root
@@ -103,13 +105,22 @@ class Agent:
         self.compactor = compactor or Compactor(llm)
         self.seen_files: set[str] = set()
         self.current_step = 0
+        self.last_run_changed_files: set[str] = set()
+        self.last_reply_text = ""
+        self.last_run_outcome = "idle"
         self._last_dispatch_rejected = False
         self.shell = shell or resolve_shell()
-        self.tools = build_registry(root, self.seen_files, self.shell)
+        self.tools = tools or build_registry(root, self.seen_files, self.shell)
+        self.tool_policy = tool_policy
 
-    def run(self, user_input: str) -> bool:
-        self.log.user(user_input)
+    def run(self, user_input: str, *, source: str = "user") -> bool:
+        self.last_run_outcome = "running"
+        if source == "user":
+            self.log.user(user_input)
+        else:
+            self.log.workflow_feedback(user_input)
         self.context.add_user(user_input)
+        self.last_run_changed_files.clear()
         started = time.monotonic()
         step = 0
         stuck = StuckDetector()
@@ -141,6 +152,7 @@ class Agent:
                     reason = f"上下文压缩失败，任务停止：{e}"
                     self.log.stop(reason)
                     self.ui.error(reason)
+                    self.last_run_outcome = "failed"
                     return False
 
             # 进入窗口尾部后，允许清理最近一组工具输出，尽量为本次回复留空间。
@@ -156,6 +168,7 @@ class Agent:
             if stop:
                 self.log.stop(stop.reason)
                 self.ui.notice(stop.reason)
+                self.last_run_outcome = "paused" if not stop.fatal else "failed"
                 return False
 
             # 记录的就是实际发出去的那一份 —— render 只调这一次
@@ -172,23 +185,28 @@ class Agent:
             except RetryableError as e:
                 self.log.stop(f"网络重试已用尽：{e}")
                 self.ui.notice(f"网络重试已用尽：{e}")
+                self.last_run_outcome = "failed"
                 return False
             except ContextLimitError as e:
                 self.log.stop(f"上下文错误：{e}")
                 self.ui.error(str(e))
+                self.last_run_outcome = "failed"
                 return False
             except ProtocolError as e:
                 self.log.stop(f"工具协议错误：{e}")
                 self.ui.error(str(e))
+                self.last_run_outcome = "failed"
                 return False
             except FatalError as e:
                 self.log.stop(f"致命错误：{e}")
                 self.ui.error(str(e))
+                self.last_run_outcome = "failed"
                 return False
 
             self.ui.end_stream()
             # 实测值回来了，用它校准估算系数，而不是拿它当下一轮的预算
             self.context.calibrate(reply.usage.prompt_tokens, budget.chars)
+            self.last_reply_text = reply.text or ""
             self.log.reply(
                 step, reply.text, reply.tool_calls, reply.usage,
                 reply.finish_reason,
@@ -207,6 +225,7 @@ class Agent:
                     self.context.add_assistant(reply.text, [])
                 self.log.stop(reason)
                 self.ui.error(reason)
+                self.last_run_outcome = "failed"
                 return False
             self.context.add_assistant(reply.text, reply.tool_calls)
             # 状态栏展示的是“下一次请求会看到的 active context”，不是刚发出去
@@ -217,9 +236,11 @@ class Agent:
             # 模型不再请求动作，说明它认为这一轮做完了，把控制权还给用户
             if not reply.tool_calls:
                 self.log.stop("自然终止")
+                self.last_run_outcome = "completed"
                 return True
 
             if self._execute(reply.tool_calls, stuck):
+                self.last_run_outcome = "failed"
                 return False
 
     def compact_now(self, schemas: list[dict] | None = None) -> str:
@@ -260,6 +281,51 @@ class Agent:
             f"{'；'.join(notes)}。估算 {before.tokens:,} → {after.tokens:,} tokens"
             f"（历史仍完整保留在会话记录里）"
         )
+
+    def finalize(self, handoff: str) -> str | None:
+        """把验证交接信息交还给 Developer，让它生成最终用户响应。
+
+        这是无工具的最后一轮，不执行任何新修改；验证通过后的响应由 Developer
+        自己生成，而不是由编排器拼接或复用验证前的阶段性文本。
+        """
+        self.log.workflow_feedback(handoff)
+        self.context.add_user(handoff)
+        schemas: list[dict] = []
+        step = self.current_step + 1
+        messages = self.context.render()
+        budget = self.context.measure(messages, schemas)
+        if not budget.has_room:
+            self.ui.error("最终响应没有足够的上下文空间。")
+            return None
+
+        self.current_step = step
+        self.log.request(step, messages, schemas, budget)
+        self.ui.start_thinking()
+        try:
+            reply = self._chat_with_budget(
+                messages,
+                schemas,
+                budget,
+                on_text=self.ui.stream,
+                on_retry=self.ui.retry_notice,
+            )
+        except (RetryableError, ContextLimitError, ProtocolError, FatalError) as e:
+            self.ui.end_stream()
+            self.ui.error(f"最终响应生成失败：{e}")
+            self.log.stop(f"最终响应生成失败：{e}")
+            return None
+
+        self.ui.end_stream()
+        self.context.calibrate(reply.usage.prompt_tokens, budget.chars)
+        self.last_reply_text = reply.text or ""
+        # Finalization 不提供工具 schema；即便 provider 错误地返回 tool_calls，
+        # 也只保留文本，不执行任何副作用。
+        self.context.add_assistant(reply.text, [])
+        self.log.reply(step, reply.text, [], reply.usage, reply.finish_reason)
+        self.log.stop("最终用户响应")
+        next_budget = self.context.measure(self.context.render(), self.tools.schemas())
+        self.ui.set_status(step, next_budget, reply.usage)
+        return self.last_reply_text.strip() or None
 
     def _compact(self, messages: list[dict], budget: Budget, schemas: list[dict]):
         """自动压缩。失败或降幅不够都交给 run() 停止当前任务。"""
@@ -381,8 +447,10 @@ class Agent:
         try:
             tool = self.tools.get(call.name)
             args = parse_arguments(call)
-            intent = extract_intent(args, call.name)
+            intent = extract_intent(args, call.name, required=tool.writes)
             args = validate(args, tool.parameters, call.name)
+            if self.tool_policy is not None:
+                self.tool_policy(call.name, args)
             self.ui.tool_start(call.name, args, tool.primary, intent=intent)
 
             if tool.writes and not self.ui.confirm(call.name, args):
@@ -393,6 +461,8 @@ class Agent:
             result = tool.run(**args)
             raw_result = getattr(tool, "last_raw_result", None) or result
             result = cap_output(result)
+            if call.name in ("write_file", "edit_file") and isinstance(args.get("path"), str):
+                self.last_run_changed_files.add(args["path"])
 
         except UserAbort as e:
             self._last_dispatch_rejected = True

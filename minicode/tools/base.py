@@ -35,13 +35,28 @@ def cap_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     return f"{text[:head]}{marker}{text[-tail:] if tail else ''}"[:limit]
 
 
-def extract_intent(args: dict, tool_name: str) -> str:
-    """取出每次调用的审批意图；它属于框架元数据，不传给本地工具函数。"""
+_DEFAULT_INTENTS = {
+    "read_file": "读取文件内容以了解当前实现",
+    "list_files": "查看项目文件结构以了解代码组织",
+    "grep": "搜索项目内容以定位相关代码",
+}
+
+
+def extract_intent(args: dict, tool_name: str, *, required: bool = True) -> str:
+    """取出调用意图；只读工具缺失时用框架兜底，不传给本地工具函数。
+
+    意图是审批辅助元数据，不应让模型首次探索因漏填一个非业务字段而产生失败。
+    写操作仍必须由模型明确提供意图，因为它会出现在用户的审批依据中。
+    """
     value = args.pop(INTENT_FIELD, None)
     if not isinstance(value, str):
+        if not required:
+            return _DEFAULT_INTENTS.get(tool_name, f"调用 {tool_name} 获取必要信息")
         raise ToolError(f"{tool_name} 缺少必填的调用意图 `intent`，请说明这次调用要达到什么目的。")
     intent = " ".join(value.split())
     if not intent:
+        if not required:
+            return _DEFAULT_INTENTS.get(tool_name, f"调用 {tool_name} 获取必要信息")
         raise ToolError(f"{tool_name} 的调用意图 `intent` 不能为空。")
     if len(intent) > INTENT_MAX_CHARS:
         raise ToolError(

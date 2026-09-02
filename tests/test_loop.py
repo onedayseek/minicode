@@ -118,10 +118,21 @@ def test_intent只用于展示不会传给本地工具(agent):
     assert seen == {"path": "config.py"}
 
 
-def test_缺少intent时不执行工具(agent):
+def test_只读工具缺少intent时由框架补充(agent):
     executed = []
-    agent.tools.get("read_file").run = lambda **kwargs: executed.append(kwargs) or "不该执行"
+    agent.tools.get("read_file").run = lambda **kwargs: executed.append(kwargs) or "读取完成"
     missing = ToolCall("A", "read_file", '{"path":"config.py"}')
+
+    assert agent._dispatch(missing) is True
+
+    assert executed == [{"path": "config.py"}]
+    assert agent.context.messages[-1]["content"] == "读取完成"
+
+
+def test_写操作缺少intent时仍然拒绝执行(agent):
+    executed = []
+    agent.tools.get("shell").run = lambda **kwargs: executed.append(kwargs) or "不该执行"
+    missing = ToolCall("A", "shell", '{"command":"echo hi"}')
 
     assert agent._dispatch(missing) is False
 

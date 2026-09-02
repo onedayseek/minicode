@@ -27,15 +27,21 @@ minicode -C ./some-project        # 指定工作目录
 minicode -p "给 utils.py 补测试并跑通"   # 单次任务
 minicode --resume                 # 恢复最近一次会话
 minicode --resume 20260829-002954-3420.jsonl   # 恢复指定会话
+minicode --verify -p "实现 parse_duration"  # 实验性验证增强
 ```
 
 没装的话也能直接跑：`pip install openai rich prompt_toolkit` 之后 `python -m minicode`。
 
 每次运行的会话记录写在 `工作目录/.minicode/sessions/*.jsonl`（一行一个事件，模型实际看到和产生的内容）。`--resume` 从这份记录重建对话上下文继续工作，Ctrl-C 中断或换电脑都能接着上次的进度；恢复后写新会话文件，不覆盖原记录。
+验证增强模式会额外保存当前任务身份；因步数或时间暂停后输入“继续”会沿用原始任务，`/clear` 才会开始新的任务。
 
 交互模式下可用 `/help` `/clear` `/status` `/usage` `/compact` `/log` `/exit`；输入 `/` 会显示命令补全，
 灰色的历史建议可按 Tab 接受，Alt+Enter 或 Ctrl-J 可在同一条消息中手动换行。
 写操作审批使用方向键选择、Enter 确认，Esc 可直接拒绝。
+
+`--verify` 是默认关闭的实验性模式：Developer 完成修改后，独立的 Test Designer 只读项目并生成或补充测试，
+提交一条权威验证命令和需求覆盖清单；框架用现有本地 shell 反复执行它，把失败输出回灌给 Developer，直到验证通过。
+通过后把验证摘要、覆盖项和通过结果交回 Developer，由 Developer 再生成最终用户响应。Test Designer 不能修改产品代码，普通模式行为不变。
 
 工具结果统一限制为最多 30,000 个字符，过长时保留开头和结尾；`/status` 显示当前 active context 与运行状态，`/usage` 显示累计 API 用量，`/compact` 手动把较早历史收敛成交接状态。
 历史本身只增不改 —— 收敛和压缩改的是「这一轮让模型看到什么」，原文始终留在会话记录里。
@@ -59,6 +65,7 @@ minicode/
 ├── parsing.py    流式 tool_calls 累积、JSON 修复、schema 校验
 ├── errors.py     错误分级
 ├── ui.py         渲染与审批交互
+├── verification.py  --verify 外层验证工作流
 └── tools/        read_file / write_file / edit_file / list_files / grep / shell
 ```
 

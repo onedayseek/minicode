@@ -43,6 +43,12 @@ def test_交互模式能启动并退出(tmp_path):
     assert "shell" in r.stdout  # 解析到的解释器要显示出来
 
 
+def test_verify模式在banner中明确标成实验性(tmp_path):
+    r = run_cli("-C", str(tmp_path), "--verify", stdin="/exit\n")
+    assert r.returncode == 0, r.stderr
+    assert "验证增强（实验）" in r.stdout
+
+
 def test_系统提示要求工具调用前说明意图(tmp_path):
     prompt = cli_module.load_system_prompt(tmp_path)
     assert "每个工具调用" in prompt
@@ -171,6 +177,25 @@ def test_单次模式异常终止返回非零(tmp_path, monkeypatch):
 
     assert cli_module.main(["-C", str(tmp_path), "-p", "任务"]) == 1
     assert captured == ["任务"]
+
+
+def test_verify开关把任务交给外层工作流(tmp_path, monkeypatch):
+    fake_cli(monkeypatch, iter(()))
+    calls = []
+
+    class FakeWorkflow:
+        def __init__(self, developer, *_args, **_kwargs):
+            calls.append(("init", developer))
+
+        def run(self, text):
+            calls.append(("run", text))
+            return True
+
+    monkeypatch.setattr(cli_module, "VerificationWorkflow", FakeWorkflow)
+
+    assert cli_module.main(["-C", str(tmp_path), "--verify", "-p", "实现功能"]) == 0
+    assert calls[0][0] == "init"
+    assert calls[1] == ("run", "实现功能")
 
 
 def test_上下文窗口低于项目下限时拒绝启动(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ from .loop import Agent
 from .session import SessionLog, load_session
 from .tools import resolve_shell
 from .ui import UI
+from .verification import VerificationWorkflow
 
 HELP = """\
 /help     显示本帮助
@@ -88,6 +89,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--yes", action="store_true", help="自动批准所有写操作（演示用，谨慎）"
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="启用实验性验证增强：独立生成测试并自动修复到验证通过",
+    )
     args = parser.parse_args(argv)
 
     if args.resume and args.prompt:
@@ -157,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
         llm, root, system_prompt, ui, log, shell,
         context=Context(system_prompt, window=window, max_output=max_output),
     )
+    runner = (
+        VerificationWorkflow(agent, llm, root, ui, log, shell, window, max_output)
+        if args.verify
+        else agent
+    )
 
     if restored is not None:
         log.inherit(resume_path)
@@ -173,12 +184,17 @@ def main(argv: list[str] | None = None) -> int:
         ui.total_in = restored.prompt_tokens
         ui.total_out = restored.completion_tokens
         ui.total_cached = restored.cache_hit_tokens
+        if args.verify:
+            runner.restore_state(restored.active_task, restored.workflow_state)
 
     if args.prompt:
-        return 0 if agent.run(args.prompt) else 1
+        return 0 if runner.run(args.prompt) else 1
 
     ui.banner(
-        llm.model, root, "自动批准" if args.yes else "写操作需确认",
+        llm.model,
+        root,
+        ("自动批准" if args.yes else "写操作需确认")
+        + (" · 验证增强（实验）" if args.verify else ""),
         log.path, agent.shell, agent.context,
     )
     if restored is not None:
@@ -210,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
                 agent.context.reset()
                 agent.seen_files.clear()
                 ui.status_line = ""
+                if args.verify:
+                    runner.clear()
                 log.event("clear")
                 ui.notice("已清空对话历史")
             elif command == "/status":
@@ -226,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         try:
-            agent.run(line)
+            runner.run(line)
         except KeyboardInterrupt:
             ui.end_stream()
             log.stop("用户中断")

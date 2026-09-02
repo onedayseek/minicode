@@ -309,3 +309,19 @@ def test_request只记投影的形状不存全文(tmp_path):
     assert request["messages"][1]["calls"] == ["read_file"]
     assert request["messages"][2]["chars"] == 5000
     assert "x" * 100 not in log.path.read_text(encoding="utf-8")  # 全文没被抄进去
+
+
+def test_恢复工作流任务身份和状态(tmp_path):
+    log = write_log(
+        tmp_path,
+        [
+            START,
+            {"kind": "workflow_task", "task": "实现解析器", "state": "waiting_continue"},
+            {"kind": "user", "text": "继续"},
+        ],
+    )
+
+    restored = load_session(log)
+
+    assert restored.active_task == "实现解析器"
+    assert restored.workflow_state == "waiting_continue"

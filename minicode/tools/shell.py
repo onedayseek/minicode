@@ -186,62 +186,71 @@ def _missing_executable(shell: Shell, stderr: str) -> str | None:
     return None
 
 
-def make_tools(root: Path, shell: Shell) -> list[Tool]:
+def run_command(
+    root: Path,
+    shell: Shell,
+    command: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> str:
+    """在指定工作区执行一次命令，供 shell 工具和框架工作流共用。"""
     patterns = blocked_patterns(shell)
+    if timeout < 1:
+        raise ToolError("timeout 必须是大于 0 的整数（秒）。")
+    for pattern, why in patterns:
+        if pattern.search(command):
+            raise ToolError(f"命令被拦截（{why}）。如果确有必要，请让用户手动执行。")
 
-    def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
-        if timeout < 1:
-            raise ToolError("timeout 必须是大于 0 的整数（秒）。")
-        for pattern, why in patterns:
-            if pattern.search(command):
-                raise ToolError(f"命令被拦截（{why}）。如果确有必要，请让用户手动执行。")
+    kwargs: dict = {
+        "cwd": root,
+        "stdin": subprocess.DEVNULL,  # 交互式提示会让命令永远等下去
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
 
-        kwargs: dict = {
-            "cwd": root,
-            "stdin": subprocess.DEVNULL,  # 交互式提示会让命令永远等下去
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-        }
-        if WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
+    proc = subprocess.Popen(shell.argv(command), **kwargs)
+    try:
+        out, err = proc.communicate(timeout=min(timeout, MAX_TIMEOUT))
+    except subprocess.TimeoutExpired:
+        raise ToolError(
+            f"命令超过 {timeout} 秒未结束，已连同子进程一并终止。"
+            f"如果是长任务，请加大 timeout（上限 {MAX_TIMEOUT} 秒）或拆成更小的步骤。"
+        )
+    finally:
+        # 超时和 Ctrl-C 都落到这里。后者尤其要收拾：CREATE_NEW_PROCESS_GROUP /
+        # start_new_session 把子进程隔在了另一个进程组里，它收不到终端的 Ctrl-C，
+        # 而 KeyboardInterrupt 会绕过 _dispatch 的 except Exception 一路往上，
+        # 不显式杀就留下一棵还在跑的进程树。正常结束时 poll() 已有退出码，不动。
+        if proc.poll() is None:
+            _kill_tree(proc)
+            proc.communicate()
 
-        proc = subprocess.Popen(shell.argv(command), **kwargs)
-        try:
-            out, err = proc.communicate(timeout=min(timeout, MAX_TIMEOUT))
-        except subprocess.TimeoutExpired:
-            raise ToolError(
-                f"命令超过 {timeout} 秒未结束，已连同子进程一并终止。"
-                f"如果是长任务，请加大 timeout（上限 {MAX_TIMEOUT} 秒）或拆成更小的步骤。"
-            )
-        finally:
-            # 超时和 Ctrl-C 都落到这里。后者尤其要收拾：CREATE_NEW_PROCESS_GROUP /
-            # start_new_session 把子进程隔在了另一个进程组里，它收不到终端的 Ctrl-C，
-            # 而 KeyboardInterrupt 会绕过 _dispatch 的 except Exception 一路往上，
-            # 不显式杀就留下一棵还在跑的进程树。正常结束时 poll() 已有退出码，不动。
-            if proc.poll() is None:
-                _kill_tree(proc)
-                proc.communicate()
+    stdout, stderr = _decode(out), _decode(err)
+    parts = []
+    if stdout.strip():
+        parts.append(_truncate(stdout.rstrip()))
+    if stderr.strip():
+        parts.append("[stderr]\n" + _truncate(stderr.rstrip()))
+    body = "\n".join(parts) or "（无输出）"
 
-        stdout, stderr = _decode(out), _decode(err)
-        parts = []
-        if stdout.strip():
-            parts.append(_truncate(stdout.rstrip()))
-        if stderr.strip():
-            parts.append("[stderr]\n" + _truncate(stderr.rstrip()))
-        body = "\n".join(parts) or "（无输出）"
+    if proc.returncode != 0:
+        missing = _missing_executable(shell, stderr)
+        hint = (
+            f"\n（{missing} 在当前 PATH 下找不到。它可能装在虚拟环境里，"
+            f"或者需要换一个等价命令。）"
+            if missing
+            else ""
+        )
+        return f"{EXIT_PREFIX}{proc.returncode}\n{body}{hint}"
+    return body
 
-        if proc.returncode != 0:
-            missing = _missing_executable(shell, stderr)
-            hint = (
-                f"\n（{missing} 在当前 PATH 下找不到。它可能装在虚拟环境里，"
-                f"或者需要换一个等价命令。）"
-                if missing
-                else ""
-            )
-            return f"{EXIT_PREFIX}{proc.returncode}\n{body}{hint}"
-        return body
+
+def make_tools(root: Path, shell: Shell) -> list[Tool]:
+    def execute(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+        return run_command(root, shell, command, timeout)
 
     return [
         Tool(
@@ -255,7 +264,7 @@ def make_tools(root: Path, shell: Shell) -> list[Tool]:
                 },
                 "required": ["command"],
             },
-            run=run_command,
+            run=execute,
             writes=True,
         )
     ]

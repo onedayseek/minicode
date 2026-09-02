@@ -32,6 +32,8 @@ class Restored:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cache_hit_tokens: int = 0
+    active_task: str | None = None
+    workflow_state: str = "idle"
 
 
 class SessionLog:
@@ -77,6 +79,13 @@ class SessionLog:
 
     def user(self, text: str) -> None:
         self.event("user", text=text)
+
+    def workflow_feedback(self, text: str) -> None:
+        """框架生成、但需要进入 Developer 上下文的验证反馈。"""
+        self.event("workflow_feedback", text=text)
+
+    def workflow_task(self, task: str | None, state: str) -> None:
+        self.event("workflow_task", task=task, state=state)
 
     def command(self, text: str) -> None:
         """记录本地斜杠命令；命令不属于模型对话，也不计入 token。"""
@@ -157,6 +166,8 @@ class SessionLog:
                 {"summary": restored.checkpoint[0], "covers": restored.checkpoint[1]}
                 if restored.checkpoint else None
             ),
+            active_task=restored.active_task,
+            workflow_state=restored.workflow_state,
         )
 
     def stop(self, reason: str) -> None:
@@ -223,6 +234,9 @@ def load_session(path: Path) -> "Restored":
     touched_by_call: dict[str, str] = {}
     elided: dict[str, str] = {}
     checkpoint: tuple[str, int] | None = None
+    active_task: str | None = None
+    workflow_state = "idle"
+    first_user: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
     cache_hit_tokens = 0
@@ -231,7 +245,7 @@ def load_session(path: Path) -> "Restored":
     drop: set[int] = set()
 
     def reset() -> None:
-        nonlocal checkpoint
+        nonlocal checkpoint, active_task, workflow_state, first_user
         messages.clear()
         read_paths.clear()
         tool_statuses.clear()
@@ -240,6 +254,9 @@ def load_session(path: Path) -> "Restored":
         groups.clear()
         drop.clear()
         checkpoint = None
+        active_task = None
+        workflow_state = "idle"
+        first_user = None
 
     for ev in iter_events(path):
         kind = ev.get("kind")
@@ -263,9 +280,17 @@ def load_session(path: Path) -> "Restored":
                 (raw_checkpoint.get("summary", ""), raw_checkpoint.get("covers", 0))
                 if isinstance(raw_checkpoint, dict) else None
             )
+            active_task = ev.get("active_task")
+            workflow_state = ev.get("workflow_state", "idle")
 
-        elif kind == "user":
+        elif kind == "workflow_task":
+            active_task = ev.get("task")
+            workflow_state = ev.get("state", "idle")
+
+        elif kind in ("user", "workflow_feedback"):
             messages.append({"role": "user", "content": ev.get("text", "")})
+            if kind == "user" and first_user is None:
+                first_user = ev.get("text", "")
 
         elif kind == "reply":
             prompt_tokens += ev.get("prompt_tokens", 0) or 0
@@ -286,7 +311,13 @@ def load_session(path: Path) -> "Restored":
                 touched_by_call.update(_touched_paths(calls))
             messages.append(msg)
 
-        elif kind == "compaction_usage":
+        elif kind == "verification_reply":
+            # Verifier 使用独立上下文；只累计用量，绝不能混进 Developer 的恢复历史。
+            prompt_tokens += ev.get("prompt_tokens", 0) or 0
+            completion_tokens += ev.get("completion_tokens", 0) or 0
+            cache_hit_tokens += ev.get("cache_hit_tokens", 0) or 0
+
+        elif kind in ("compaction_usage", "verification_compaction_usage"):
             prompt_tokens += ev.get("prompt_tokens", 0) or 0
             completion_tokens += ev.get("completion_tokens", 0) or 0
             cache_hit_tokens += ev.get("cache_hit_tokens", 0) or 0
@@ -364,6 +395,8 @@ def load_session(path: Path) -> "Restored":
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cache_hit_tokens=cache_hit_tokens,
+        active_task=active_task or first_user,
+        workflow_state=workflow_state,
     )
 
 

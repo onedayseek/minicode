@@ -87,6 +87,7 @@ TOOL_LABELS = {
     "list_files": "List",
     "grep": "Search",
     "shell": "Run",
+    "submit_tests": "Submit tests",
 }
 
 _PROMPT_STYLE = Style.from_dict(
